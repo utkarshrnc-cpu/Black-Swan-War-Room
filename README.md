@@ -2,7 +2,7 @@
 
 > A CFO crisis-response platform for navigating black-swan events with grounded AI, in minutes instead of weeks.
 
-Built as a PwC hackathon demo for **Meridian Drivetrain Systems, Inc.** — a fictional Tier-1 automotive parts manufacturer ($195M revenue, 6 NA plants, 240 suppliers, FY2026 baseline).
+The scenario centers on **Meridian Drivetrain Systems, Inc.** — a fictional Tier-1 automotive parts manufacturer ($195M revenue, 6 NA plants, 240 suppliers, FY2026 baseline).
 
 The framing: **the AI proposes; the human disposes.**
 The grounding rule: **every $-figure traces to a Databricks query on Datasphere — the LLM narrates but never produces numbers.**
