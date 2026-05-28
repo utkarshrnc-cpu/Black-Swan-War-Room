@@ -50,6 +50,7 @@ import {
   History, Sliders, ListChecks, Power, Eye, Users, Wrench
 } from 'lucide-react';
 import PptxGenJS from 'pptxgenjs';
+import * as XLSX from 'xlsx';
 import {
   DndContext, useDraggable, useDroppable, DragOverlay,
   PointerSensor, useSensor, useSensors, closestCenter,
@@ -138,11 +139,20 @@ const CASCADE_PALETTES = {
 const CATEGORY_PALETTE = CHART_PALETTES['war-room'];
 
 /* ============================================================================
- * SECTION 2: MOCK DATA — Auto Parts Manufacturer
- * Revenue $195M · 6 NA plants · 2,400 employees · 240 suppliers · FY2026
+ * SECTION 2: DEFAULT DATASET — Meridian Drivetrain Systems (Demo Mode)
+ *
+ * All of the data that defines the active scenario (company, budget,
+ * suppliers, events, strategies, signals, saved plays, activity feed) lives
+ * here as the built-in defaults. At runtime, the zustand store holds an
+ * active `data` object that the whole app reads from — components NEVER
+ * reach for these MERIDIAN_* constants directly.
+ *
+ * The same shape can come from `buildUploadedDataset(parsedWorkbook, fileName)`
+ * — see SECTION 2.5. Either way, downstream consumers (cascade build, Monte
+ * Carlo, solver, KPI strip, donut, heatmap) operate identically.
  * ========================================================================== */
 
-const COMPANY = {
+const MERIDIAN_COMPANY = {
   name: 'Meridian Drivetrain Systems, Inc.',
   ticker: 'NYSE: MDS (private; mock)',
   revenue: 195_000_000,
@@ -164,22 +174,22 @@ const COMPANY = {
   ],
 };
 
-const BUDGET_CATEGORIES = [
-  { id: 'raw',     name: 'Raw Materials',     color: CATEGORY_PALETTE[0] },
-  { id: 'comp',    name: 'Components',        color: CATEGORY_PALETTE[1] },
-  { id: 'labor',   name: 'Direct Labor',      color: CATEGORY_PALETTE[2] },
-  { id: 'maint',   name: 'Maintenance',       color: CATEGORY_PALETTE[3] },
-  { id: 'log',     name: 'Logistics',         color: CATEGORY_PALETTE[4] },
-  { id: 'qual',    name: 'Quality',           color: CATEGORY_PALETTE[5] },
-  { id: 'indir',   name: 'Indirect',          color: CATEGORY_PALETTE[6] },
-  { id: 'over',    name: 'Overhead',          color: CATEGORY_PALETTE[7] },
-  { id: 'rd',      name: 'R&D',               color: CATEGORY_PALETTE[8] },
-  { id: 'sm',      name: 'Sales & Marketing', color: CATEGORY_PALETTE[9] },
-  { id: 'trade',   name: 'Trade Costs',       color: CATEGORY_PALETTE[10] },
+const MERIDIAN_BUDGET_CATEGORIES = [
+  { id: 'raw',     name: 'Raw Materials' },
+  { id: 'comp',    name: 'Components' },
+  { id: 'labor',   name: 'Direct Labor' },
+  { id: 'maint',   name: 'Maintenance' },
+  { id: 'log',     name: 'Logistics' },
+  { id: 'qual',    name: 'Quality' },
+  { id: 'indir',   name: 'Indirect' },
+  { id: 'over',    name: 'Overhead' },
+  { id: 'rd',      name: 'R&D' },
+  { id: 'sm',      name: 'Sales & Marketing' },
+  { id: 'trade',   name: 'Trade Costs' },
 ];
 
-// 60-line operating budget. Numbers sum to ~$135M.
-const BUDGET_LINES = [
+// 60-line operating budget. Numbers sum to ~$135M before scaling.
+const MERIDIAN_BUDGET_LINES = [
   // Raw Materials (12 lines) — heavy steel/aluminum/copper exposure
   { id: 'RM-001', cat: 'raw',   name: 'Hot-rolled steel coil',        fy25: 18_400_000, esc: 0.062, sap: 'S/4 GL 511010', risk: 'commodity-steel'  },
   { id: 'RM-002', cat: 'raw',   name: 'Aluminum extrusions',          fy25: 8_900_000,  esc: 0.041, sap: 'S/4 GL 511020', risk: 'commodity-alu'    },
@@ -263,51 +273,46 @@ const BUDGET_LINES = [
   { id: 'TR-003', cat: 'trade', name: 'Currency hedging premium',     fy25: 680_000,    esc: 0.072, sap: 'BDC FX',         risk: 'fx'             },
 ];
 
-// Normalize FY25 totals so FY26 OpEx lands near $134M against $195M revenue —
-// yielding ~31.2% Gross Margin (target 32%, -80bps to target per KPI strip text).
+// Scaling helper — applied at dataset-build time. Normalizes FY25 totals so
+// FY26 OpEx lands near $134M against $195M revenue, yielding ~31.2% Gross Margin.
 // Preserves relative proportions across the 60 lines.
-// Without this scaling, raw values summed to ~$186M and crushed Gross Margin to 0%.
-{
+function scaleMeridianBudget(lines) {
   const TARGET_FY26_OPEX = 134_000_000;
-  const avgEsc = BUDGET_LINES.reduce((s, l) => s + l.esc, 0) / BUDGET_LINES.length;
-  const rawTotal = BUDGET_LINES.reduce((s, l) => s + l.fy25, 0);
+  const avgEsc = lines.reduce((s, l) => s + l.esc, 0) / lines.length;
+  const rawTotal = lines.reduce((s, l) => s + l.fy25, 0);
   const targetFy25 = TARGET_FY26_OPEX / (1 + avgEsc);
   const scale = targetFy25 / rawTotal;
-  BUDGET_LINES.forEach(l => { l.fy25 = Math.round(l.fy25 * scale); });
+  lines.forEach(l => {
+    l.fy25 = Math.round(l.fy25 * scale);
+    l.fy26 = Math.round(l.fy25 * (1 + l.esc));
+  });
+  return lines;
 }
 
-// Pre-compute baseline (FY2026)
-BUDGET_LINES.forEach(l => {
-  l.fy26 = Math.round(l.fy25 * (1 + l.esc));
-});
-
-const BUDGET_TOTAL_FY26 = BUDGET_LINES.reduce((s, l) => s + l.fy26, 0);
-const BUDGET_TOTAL_FY25 = BUDGET_LINES.reduce((s, l) => s + l.fy25, 0);
-
 // ---------- 240 suppliers ----------
-const REGIONS = {
+const MERIDIAN_REGIONS = {
   NA: { name: 'North America', cities: [['Detroit','US'],['Cleveland','US'],['Pittsburgh','US'],['Toledo','US'],['Monterrey','MX'],['Saltillo','MX'],['Windsor','CA'],['Toronto','CA'],['Knoxville','US'],['Houston','US']] },
   EU: { name: 'Europe',        cities: [['Stuttgart','DE'],['Munich','DE'],['Düsseldorf','DE'],['Milan','IT'],['Turin','IT'],['Lyon','FR'],['Liverpool','UK'],['Madrid','ES'],['Brno','CZ'],['Gdansk','PL']] },
   AS: { name: 'Asia',          cities: [['Shanghai','CN'],['Guangzhou','CN'],['Suzhou','CN'],['Tianjin','CN'],['Busan','KR'],['Ulsan','KR'],['Nagoya','JP'],['Osaka','JP'],['Bangkok','TH'],['Ho Chi Minh','VN'],['Chennai','IN'],['Pune','IN']] },
   ME: { name: 'Middle East',   cities: [['Dubai','AE'],['Doha','QA'],['Jeddah','SA'],['Manama','BH']] },
 };
 
-const SUPPLIER_NAMES_BY_REGION = {
+const MERIDIAN_SUPPLIER_NAMES_BY_REGION = {
   NA: ['Westshore Forge','Lakeshore Metals','Great Lakes Alloy','Anchor Bearings','Riverbend Components','Apex Drivetrain','Stonecreek Tool','Northern Castings','Concordia Polymers','Pinnacle Stampings','Cascade Industrial','Foundry Hills','Ironworks Group','Continental Wire','Vanguard Sensors','Magnolia Hydraulics','Cardinal Electronics','Summit Forge','Hudson Fasteners','Granite Foundry'],
   EU: ['Bauer-Müller GmbH','Rheingruppe AG','Brennero Componenti','Lyonnaise Métaux','Reichsmann Stahl','Schwarzwald Castings','Stratos Hellenic','Vermes Hungaria','Lübeck Maritime','Frigus Polska','Iberforge SA','Acciaio Italiana','Brescia Components','Kortrijk Polymers','Östra Bearings','Vasa Industries','Krakow Stampings','Salzburg Sensors','Genova Hydraulics','Wittenberg Tool'],
   AS: ['Yangzhou Precision','Baosteel Components','Suzhou Metalcraft','Tianjin Drivetrain','Hyundai Mobis Tier','Daehwa Forging','Komatsu Bearings','Aichi Stamping','Mitsuba Wire','Toyo Polymers','Bangkok Diecast','Saigon Components','Chennai Castings','Pune Forge Works','Guangzhou Sensors','Shenzhen Electronics','Jiangsu Hydraulics','Bharat Steel','Wuxi Tooling','Qingdao Industrial'],
   ME: ['Gulf Steel Industries','Doha Petrochem Supply','Manama Bearings Co','Jubail Aluminum Works'],
 };
 
-function makeSuppliers() {
+function makeMeridianSuppliers() {
   const list = [];
   let n = 0;
   const targets = { NA: 110, EU: 60, AS: 60, ME: 10 };
 
   const regions = Object.keys(targets);
   for (const r of regions) {
-    const cities = REGIONS[r].cities;
-    const names = SUPPLIER_NAMES_BY_REGION[r];
+    const cities = MERIDIAN_REGIONS[r].cities;
+    const names = MERIDIAN_SUPPLIER_NAMES_BY_REGION[r];
     const total = targets[r];
     for (let i = 0; i < total; i++) {
       const city = cities[i % cities.length];
@@ -331,7 +336,7 @@ function makeSuppliers() {
       const mats = [materialsList[(i + 0) % materialsList.length], materialsList[(i + 4) % materialsList.length]];
 
       const spend = Math.round((250 + (seed * 31)) * 1000); // $K range
-      const plant = COMPANY.plants[i % COMPANY.plants.length].id;
+      const plant = MERIDIAN_COMPANY.plants[i % MERIDIAN_COMPANY.plants.length].id;
 
       // Hormuz exposure: ~22 suppliers tied to ME / oil-derivative / ocean freight from AS
       let hormuzExposed = false;
@@ -345,16 +350,16 @@ function makeSuppliers() {
         materials: mats, otd: Math.round(otd * 1000) / 1000,
         credit, riskScore: Math.min(95, baseRisk),
         spend, plant, hormuzExposed,
+        // Unified flag used by buildCascade for both Meridian and uploaded data
+        eventExposed: hormuzExposed,
       });
     }
   }
   return list;
 }
 
-const SUPPLIERS = makeSuppliers();
-
 // ---------- 12 events for demo controls ----------
-const EVENTS = [
+const MERIDIAN_EVENTS = [
   {
     id: 'HORMUZ',
     label: 'Strait of Hormuz Blockade',
@@ -417,19 +422,31 @@ const EVENTS = [
   { id: 'UAW_STRIKE',     label: 'UAW Strike Authorization Vote',            severity: 'High',   region: 'North America',  summary: 'UAW Local 600 authorizes strike vote; Detroit plant ramp at risk.', aiBlurb: 'Stub.', impactRange: { min: 2_100_000, mode: 3_400_000, max: 5_200_000 }, affectedLineIds: ['LB-001','LB-004','SM-001'], detailedDrivers: [{name:'Strike duration uncertainty',weight:0.66},{name:'Customer line-down penalty',weight:0.24},{name:'Replacement labor cost',weight:0.10}] },
 ];
 
-const EVENT_BY_ID = Object.fromEntries(EVENTS.map(e => [e.id, e]));
+// ---------- Cascading impact graph — pure function of (event, data) ----------
+// `data` is the active dataset (Meridian default or uploaded). For Meridian
+// the per-event supplier filter knows about hormuzExposed / asia / mexico
+// rules; for uploaded data, `eventExposed === true` is the universal flag.
+function buildCascade(event, data) {
+  const suppliers = data.suppliers;
+  const budgetLines = data.budgetLines;
+  const companyPlants = data.company.plants || [];
 
-// ---------- Cascading impact graph (Hormuz default; built per event) ----------
-function buildCascade(event) {
-  const affectedSuppliers = SUPPLIERS
-    .filter(s => event.id === 'HORMUZ' ? s.hormuzExposed :
-                 event.id === 'CHINA_TARIFF' ? (s.region === 'AS' && s.riskScore > 50) :
-                 event.id === 'USMCA_AUDIT' ? (s.country === 'MX') :
-                 s.riskScore > 60)
+  const affectedSuppliers = suppliers
+    .filter(s => {
+      // Meridian-specific per-event rules (only fire when those event ids exist)
+      if (data.source.type === 'demo') {
+        if (event.id === 'HORMUZ') return s.hormuzExposed;
+        if (event.id === 'CHINA_TARIFF') return (s.region === 'AS' && s.riskScore > 50);
+        if (event.id === 'USMCA_AUDIT') return (s.country === 'MX');
+        return s.riskScore > 60;
+      }
+      // Uploaded data: single per-supplier eventExposed flag
+      return !!s.eventExposed;
+    })
     .slice(0, 10);
 
-  const lines = event.affectedLineIds.map(id => BUDGET_LINES.find(l => l.id === id)).filter(Boolean);
-  const plants = COMPANY.plants.slice(0, 4);
+  const lines = (event.affectedLineIds || []).map(id => budgetLines.find(l => l.id === id)).filter(Boolean);
+  const plants = companyPlants.slice(0, 4);
 
   const nodes = [];
   const links = [];
@@ -479,7 +496,7 @@ function buildCascade(event) {
 }
 
 // ---------- Mitigation strategies (per Hormuz, with composable clauses) ----------
-const CLAUSES = {
+const MERIDIAN_CLAUSES = {
   DUAL: { id: 'DUAL', name: 'Dual-source', savingsMin: 800_000, savingsMode: 1_200_000, savingsMax: 1_700_000, feasibility: { capacity: 'green', leadTime: 'amber', compliance: 'green' }, compliance: { usmca: true, ofac: true, ear: true } },
   PREBUILD: { id: 'PREBUILD', name: 'Inventory pre-build (60d)', savingsMin: 500_000, savingsMode: 850_000, savingsMax: 1_300_000, feasibility: { capacity: 'amber', leadTime: 'green', compliance: 'green' }, compliance: { usmca: true, ofac: true, ear: true } },
   PASSTHRU: { id: 'PASSTHRU', name: 'Price pass-through to OEM', savingsMin: 600_000, savingsMode: 950_000, savingsMax: 1_400_000, feasibility: { capacity: 'green', leadTime: 'green', compliance: 'amber' }, compliance: { usmca: true, ofac: true, ear: false } },
@@ -490,7 +507,7 @@ const CLAUSES = {
   USMCA_SHIFT: { id: 'USMCA_SHIFT', name: 'Shift volume to Monterrey under USMCA', savingsMin: 700_000, savingsMode: 1_100_000, savingsMax: 1_600_000, feasibility: { capacity: 'amber', leadTime: 'amber', compliance: 'green' }, compliance: { usmca: true, ofac: true, ear: true } },
 };
 
-const STRATEGIES = [
+const MERIDIAN_STRATEGIES = [
   {
     id: 'MIT-001',
     name: 'Dual-source steel via POSCO + Nucor',
@@ -523,7 +540,7 @@ const STRATEGIES = [
 
 // ---------- Alternative strategies (Path C — surfaced after Reject) ----------
 // Demand-side / financial / time-buying philosophies — distinct from the supply-side primary set.
-const ALTERNATIVE_CLAUSES = {
+const MERIDIAN_ALT_CLAUSES = {
   PASSTHRU60:     { id: 'PASSTHRU60',    name: '60% pass-through to top 12 OEMs',     savingsMin: 900_000,  savingsMode: 1_350_000, savingsMax: 1_900_000, feasibility: { capacity: 'green', leadTime: 'green', compliance: 'amber' }, compliance: { usmca: true, ofac: true, ear: true }, philosophy: 'demand' },
   CONTRACT_MAC:   { id: 'CONTRACT_MAC',  name: 'Invoke MAC / force-majeure clauses',  savingsMin: 400_000,  savingsMode: 700_000,   savingsMax: 1_100_000, feasibility: { capacity: 'green', leadTime: 'amber', compliance: 'amber' }, compliance: { usmca: true, ofac: true, ear: true }, philosophy: 'demand' },
   HEDGE_FX_90:    { id: 'HEDGE_FX_90',   name: 'Extend FX hedge 70% → 90%',           savingsMin: 350_000,  savingsMode: 600_000,   savingsMax: 950_000,   feasibility: { capacity: 'green', leadTime: 'green', compliance: 'green' }, compliance: { usmca: true, ofac: true, ear: true }, philosophy: 'financial' },
@@ -534,10 +551,9 @@ const ALTERNATIVE_CLAUSES = {
   QUOTE_DELAY:    { id: 'QUOTE_DELAY',   name: 'Pause new OEM quotes 30d',            savingsMin: 150_000,  savingsMode: 300_000,   savingsMax: 500_000,   feasibility: { capacity: 'green', leadTime: 'green', compliance: 'amber' }, compliance: { usmca: true, ofac: true, ear: true }, philosophy: 'time' },
 };
 
-// Merge alternative clauses into main CLAUSES so the solver finds them by id
-Object.assign(CLAUSES, ALTERNATIVE_CLAUSES);
+// (Merge of primary + alternative clauses happens inside buildMeridianDataset.)
 
-const ALTERNATIVE_STRATEGIES = [
+const MERIDIAN_ALT_STRATEGIES = [
   {
     id: 'ALT-001',
     name: 'Price Pass-Through to Key Accounts',
@@ -565,7 +581,7 @@ const ALTERNATIVE_STRATEGIES = [
 ];
 
 // ---------- 2 fully formed saved plays ----------
-const SAVED_PLAYS = [
+const MERIDIAN_SAVED_PLAYS = [
   {
     id: 'PLAY-2024-RS',
     name: '2024 Red Sea Crisis',
@@ -587,7 +603,7 @@ const SAVED_PLAYS = [
 ];
 
 // ---------- Live signal feed pool ----------
-const SIGNAL_POOL = [
+const MERIDIAN_SIGNAL_POOL = [
   { type: 'geo', text: 'Iranian naval forces escalate Strait of Hormuz patrols — 3 tanker incidents reported in last 48hr', confidence: 'red', tagId: 'HORMUZ_PRESTAGE' },
   { type: 'commodity', text: 'Hot-rolled steel coil (US Midwest)', value: '+2.4%', confidence: 'amber' },
   { type: 'commodity', text: 'Aluminum LME 3M',                  value: '+1.1%', confidence: 'green' },
@@ -629,7 +645,7 @@ const SIGNAL_POOL = [
 ];
 
 // ---------- Activity feed (steady state ambient) ----------
-const RECENT_ACTIVITY = [
+const MERIDIAN_RECENT_ACTIVITY = [
   { ts: '10:18:42', actor: 'A. Patel · FP&A',         action: 'Revised',  object: 'CO-002 Electronic control modules', detail: '+$120K accrual' },
   { ts: '10:14:11', actor: 'M. Okafor · Procurement', action: 'Approved', object: 'PO-78431 to Hyundai Mobis',           detail: '$340K' },
   { ts: '10:09:54', actor: 'L. Chen · CFO',           action: 'Reviewed', object: 'Q3 forecast bridge',                  detail: 'No change' },
@@ -638,6 +654,557 @@ const RECENT_ACTIVITY = [
   { ts: '09:51:08', actor: 'System',                  action: 'Retrained', object: 'tariff-impact Bayesian v2.7',         detail: 'CRPS 0.18' },
   { ts: '09:45:33', actor: 'D. Kowalski · Eng',       action: 'Released', object: 'BOM-DRIVE-A12 rev 14',                detail: '3 SKU updates' },
 ];
+
+// ============================================================================
+// Dataset factory — Meridian default. The whole app reads from a `data` object
+// in zustand; this factory produces that object from the MERIDIAN_* constants.
+// `buildUploadedDataset` (below) produces the same shape from a parsed workbook.
+// ============================================================================
+function buildMeridianDataset() {
+  // Deep-clone the budget lines and run the scaling pass so repeated builds
+  // are idempotent (no mutation of the module-level array).
+  const budgetLines = MERIDIAN_BUDGET_LINES.map(l => ({ ...l }));
+  scaleMeridianBudget(budgetLines);
+
+  const budgetTotalFy25 = budgetLines.reduce((s, l) => s + l.fy25, 0);
+  const budgetTotalFy26 = budgetLines.reduce((s, l) => s + l.fy26, 0);
+
+  const palette = CHART_PALETTES['war-room'];
+  const budgetCategories = MERIDIAN_BUDGET_CATEGORIES.map((c, i) => ({
+    ...c, color: palette[i % palette.length],
+  }));
+
+  const suppliers = makeMeridianSuppliers();
+  const events = MERIDIAN_EVENTS.map(e => ({ ...e, affectedLineIds: [...e.affectedLineIds] }));
+  const eventById = Object.fromEntries(events.map(e => [e.id, e]));
+
+  // Merge primary + alternative clauses into a single id-keyed map
+  const clauses = { ...MERIDIAN_CLAUSES, ...MERIDIAN_ALT_CLAUSES };
+
+  return {
+    company: MERIDIAN_COMPANY,
+    budgetCategories,
+    budgetLines,
+    budgetTotalFy25,
+    budgetTotalFy26,
+    suppliers,
+    regions: MERIDIAN_REGIONS,
+    events,
+    eventById,
+    strategies: MERIDIAN_STRATEGIES.map(s => ({ ...s, clauses: [...s.clauses] })),
+    alternativeStrategies: MERIDIAN_ALT_STRATEGIES.map(s => ({ ...s, clauses: [...s.clauses] })),
+    clauses,
+    signalPool: MERIDIAN_SIGNAL_POOL.map(s => ({ ...s })),
+    savedPlays: MERIDIAN_SAVED_PLAYS.map(p => ({ ...p, composition: [...p.composition] })),
+    recentActivity: MERIDIAN_RECENT_ACTIVITY.map(a => ({ ...a })),
+    source: {
+      type: 'demo',
+      fileName: null,
+      companyName: MERIDIAN_COMPANY.name,
+      label: 'Built-in demo data',
+    },
+  };
+}
+
+/* ============================================================================
+ * SECTION 2.5: EXCEL INGESTION
+ *
+ * parseAndValidateWorkbook(file)  → Promise<{ ok, data?, errors, warnings }>
+ *   Reads a user-uploaded .xlsx, validates all 8 required sheets, returns
+ *   either a built dataset or a list of row-level errors.
+ *
+ * buildUploadedDataset(parsed, fileName)  →  dataset (same shape as Meridian)
+ *   Pure mapper: takes the validated, parsed sheet rows and produces the
+ *   active-data shape. P10/P50/P90 and Savings_P50_M are converted from
+ *   $ millions to whole dollars at this boundary so downstream code sees
+ *   consistent units.
+ * ========================================================================== */
+
+const REGION_NAME_TO_CODE = {
+  'North America': 'NA', 'Europe': 'EU', 'Asia': 'AS', 'Middle East': 'ME',
+  'South America': 'SA', 'Latin America': 'SA', 'Oceania': 'OC', 'Africa': 'AF',
+};
+
+const SLUG_RE = /[^A-Za-z0-9]+/g;
+function slugify(s, fallback = 'item') {
+  if (!s) return fallback;
+  const slug = String(s).trim().replace(SLUG_RE, '_').replace(/^_+|_+$/g, '').toUpperCase();
+  return slug || fallback;
+}
+
+// Find the data row range for a sheet by locating the header row containing
+// the expected first-column key (e.g. 'Field', 'Line_ID', 'Supplier_ID').
+function locateHeader(rows, expectedFirstCol) {
+  return rows.findIndex(r => Array.isArray(r) && r[0] === expectedFirstCol);
+}
+
+// Pure validator. Returns { ok, errors, warnings, parsed } where `parsed`
+// is the raw row-object form of each sheet, ready to feed buildUploadedDataset.
+function validateWorkbook(wb) {
+  const errors = [];
+  const warnings = [];
+  const REQUIRED_SHEETS = ['Company','Budget_Lines','Suppliers','Events','Event_Impacts','Strategies','Signals','README'];
+
+  // 1. Required sheets
+  for (const sheet of REQUIRED_SHEETS) {
+    if (!wb.SheetNames.includes(sheet)) {
+      errors.push({ sheet, message: `Missing required sheet: ${sheet}` });
+    }
+  }
+  if (errors.length > 0) return { ok: false, errors, warnings };
+
+  const parsed = {};
+
+  // --- Company (key/value pairs) ---
+  {
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets.Company, { header: 1, defval: null });
+    const headerIdx = locateHeader(rows, 'Field');
+    if (headerIdx < 0) {
+      errors.push({ sheet: 'Company', message: 'Could not find header row "Field | Value | Notes"' });
+    } else {
+      const company = {};
+      for (let i = headerIdx + 1; i < rows.length; i++) {
+        const [key, value] = rows[i] || [];
+        if (key) company[key] = value;
+      }
+      parsed.company = company;
+
+      if (!company.Company_Name) {
+        errors.push({ sheet: 'Company', message: 'Company_Name is required' });
+      }
+      for (const f of ['Revenue_USD','Operating_Expense_USD']) {
+        if (typeof company[f] !== 'number') {
+          errors.push({ sheet: 'Company', message: `${f} must be a number (got: ${JSON.stringify(company[f])})` });
+        }
+      }
+    }
+  }
+
+  // --- Budget_Lines (table) ---
+  {
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets.Budget_Lines, { header: 1, defval: null });
+    const headerIdx = locateHeader(rows, 'Line_ID');
+    if (headerIdx < 0) {
+      errors.push({ sheet: 'Budget_Lines', message: 'Could not find header row starting with Line_ID' });
+    } else {
+      const headers = rows[headerIdx];
+      const data = [];
+      const seen = new Set();
+      for (let i = headerIdx + 1; i < rows.length; i++) {
+        const row = rows[i] || [];
+        const lineId = row[0];
+        if (!lineId) break;                                // stop at first blank
+        const nameStr = String(row[1] || '').toUpperCase();
+        if (nameStr.includes('TOTAL OPERATING EXPENSE')) break;
+        const obj = {};
+        headers.forEach((h, j) => { if (h) obj[h] = row[j]; });
+        const rowNum = i + 1;
+        if (seen.has(lineId)) errors.push({ sheet: 'Budget_Lines', row: rowNum, message: `Duplicate Line_ID '${lineId}'` });
+        seen.add(lineId);
+        if (!obj.Category) errors.push({ sheet: 'Budget_Lines', row: rowNum, message: `Category is blank for Line_ID '${lineId}'` });
+        if (typeof obj.FY_Current !== 'number') errors.push({ sheet: 'Budget_Lines', row: rowNum, message: `FY_Current is not a number (got: ${JSON.stringify(obj.FY_Current)})` });
+        data.push(obj);
+      }
+      if (data.length === 0) errors.push({ sheet: 'Budget_Lines', message: 'No budget line rows found' });
+      parsed.budgetLines = data;
+    }
+  }
+
+  // --- Suppliers (table) ---
+  {
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets.Suppliers, { header: 1, defval: null });
+    const headerIdx = locateHeader(rows, 'Supplier_ID');
+    if (headerIdx < 0) {
+      errors.push({ sheet: 'Suppliers', message: 'Could not find header row starting with Supplier_ID' });
+    } else {
+      const headers = rows[headerIdx];
+      const data = [];
+      const seen = new Set();
+      for (let i = headerIdx + 1; i < rows.length; i++) {
+        const row = rows[i] || [];
+        const supId = row[0];
+        if (!supId) continue;
+        if (typeof supId === 'string' && supId.toLowerCase().startsWith('note')) continue;
+        const obj = {};
+        headers.forEach((h, j) => { if (h) obj[h] = row[j]; });
+        const rowNum = i + 1;
+        if (seen.has(supId)) errors.push({ sheet: 'Suppliers', row: rowNum, message: `Duplicate Supplier_ID '${supId}'` });
+        seen.add(supId);
+        if (!obj.Region) errors.push({ sheet: 'Suppliers', row: rowNum, message: `Region is blank for Supplier_ID '${supId}'` });
+        if (typeof obj.Risk_Score !== 'number' || obj.Risk_Score < 0 || obj.Risk_Score > 100) {
+          errors.push({ sheet: 'Suppliers', row: rowNum, message: `Risk_Score must be numeric 0–100 (got: ${JSON.stringify(obj.Risk_Score)})` });
+        }
+        data.push(obj);
+      }
+      if (data.length === 0) errors.push({ sheet: 'Suppliers', message: 'No supplier rows found' });
+      parsed.suppliers = data;
+    }
+  }
+
+  // --- Events (table) ---
+  {
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets.Events, { header: 1, defval: null });
+    const headerIdx = locateHeader(rows, 'Event_ID');
+    if (headerIdx < 0) {
+      errors.push({ sheet: 'Events', message: 'Could not find header row starting with Event_ID' });
+    } else {
+      const headers = rows[headerIdx];
+      const data = [];
+      const seen = new Set();
+      for (let i = headerIdx + 1; i < rows.length; i++) {
+        const row = rows[i] || [];
+        const evId = row[0];
+        if (!evId) continue;
+        const obj = {};
+        headers.forEach((h, j) => { if (h) obj[h] = row[j]; });
+        const rowNum = i + 1;
+        if (seen.has(evId)) errors.push({ sheet: 'Events', row: rowNum, message: `Duplicate Event_ID '${evId}'` });
+        seen.add(evId);
+        const p10 = obj.P10_M, p50 = obj.P50_M, p90 = obj.P90_M;
+        if (typeof p10 !== 'number' || typeof p50 !== 'number' || typeof p90 !== 'number') {
+          errors.push({ sheet: 'Events', row: rowNum, message: `P10_M, P50_M, P90_M must all be numeric for Event_ID '${evId}'` });
+        } else if (!(p10 <= p50 && p50 <= p90)) {
+          errors.push({ sheet: 'Events', row: rowNum, message: `Must satisfy P10 (${p10}) ≤ P50 (${p50}) ≤ P90 (${p90})` });
+        }
+        data.push(obj);
+      }
+      if (data.length === 0) errors.push({ sheet: 'Events', message: 'No event rows found' });
+      parsed.events = data;
+    }
+  }
+
+  // --- Event_Impacts (table) — needs Events + Budget_Lines for ref checks ---
+  {
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets.Event_Impacts, { header: 1, defval: null });
+    const headerIdx = locateHeader(rows, 'Event_ID');
+    if (headerIdx < 0) {
+      errors.push({ sheet: 'Event_Impacts', message: 'Could not find header row' });
+    } else {
+      const headers = rows[headerIdx];
+      const data = [];
+      const validEv = new Set((parsed.events || []).map(e => e.Event_ID));
+      const validLn = new Set((parsed.budgetLines || []).map(l => l.Line_ID));
+      for (let i = headerIdx + 1; i < rows.length; i++) {
+        const row = rows[i] || [];
+        if (!row[0]) continue;
+        const obj = {};
+        headers.forEach((h, j) => { if (h) obj[h] = row[j]; });
+        const rowNum = i + 1;
+        if (!validEv.has(obj.Event_ID)) errors.push({ sheet: 'Event_Impacts', row: rowNum, message: `Event_ID '${obj.Event_ID}' not found in Events` });
+        if (!validLn.has(obj.Line_ID))  errors.push({ sheet: 'Event_Impacts', row: rowNum, message: `Line_ID '${obj.Line_ID}' not found in Budget_Lines` });
+        if (typeof obj.Impact_Weight !== 'number' || obj.Impact_Weight < 0 || obj.Impact_Weight > 1) {
+          errors.push({ sheet: 'Event_Impacts', row: rowNum, message: `Impact_Weight must be numeric 0–1 (got: ${JSON.stringify(obj.Impact_Weight)})` });
+        }
+        data.push(obj);
+      }
+      parsed.eventImpacts = data;
+    }
+  }
+
+  // --- Strategies (table) ---
+  {
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets.Strategies, { header: 1, defval: null });
+    const headerIdx = locateHeader(rows, 'Strategy_ID');
+    if (headerIdx < 0) {
+      errors.push({ sheet: 'Strategies', message: 'Could not find header row' });
+    } else {
+      const headers = rows[headerIdx];
+      const clausesColIdx = headers.findIndex(h => h && /Clauses/i.test(h));
+      const data = [];
+      const seen = new Set();
+      for (let i = headerIdx + 1; i < rows.length; i++) {
+        const row = rows[i] || [];
+        const strId = row[0];
+        if (!strId) continue;
+        const obj = {};
+        headers.forEach((h, j) => { if (h) obj[h] = row[j]; });
+        obj._clausesRaw = clausesColIdx >= 0 ? row[clausesColIdx] : '';
+        const rowNum = i + 1;
+        if (seen.has(strId)) errors.push({ sheet: 'Strategies', row: rowNum, message: `Duplicate Strategy_ID '${strId}'` });
+        seen.add(strId);
+        if (typeof obj.Savings_P50_M !== 'number') errors.push({ sheet: 'Strategies', row: rowNum, message: `Savings_P50_M must be numeric for Strategy_ID '${strId}'` });
+        const clauseList = String(obj._clausesRaw || '').split(';').map(c => c.trim()).filter(Boolean);
+        if (clauseList.length === 0) errors.push({ sheet: 'Strategies', row: rowNum, message: `Strategy '${strId}' has no clauses` });
+        data.push(obj);
+      }
+      if (data.length === 0) errors.push({ sheet: 'Strategies', message: 'No strategy rows found' });
+      parsed.strategies = data;
+    }
+  }
+
+  // --- Signals (table) ---
+  {
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets.Signals, { header: 1, defval: null });
+    const headerIdx = locateHeader(rows, 'Type');
+    if (headerIdx < 0) {
+      errors.push({ sheet: 'Signals', message: 'Could not find header row starting with Type' });
+    } else {
+      const headers = rows[headerIdx];
+      const data = [];
+      let prestageCount = 0;
+      for (let i = headerIdx + 1; i < rows.length; i++) {
+        const row = rows[i] || [];
+        if (!row[0]) continue;
+        const obj = {};
+        headers.forEach((h, j) => { if (h) obj[h] = row[j]; });
+        if (String(obj.Signal_Text || '').includes('[PRESTAGE]')) prestageCount++;
+        data.push(obj);
+      }
+      if (data.length === 0) errors.push({ sheet: 'Signals', message: 'No signal rows found' });
+      if (prestageCount === 0) warnings.push({ sheet: 'Signals', message: 'No [PRESTAGE] signal defined — the first red signal will be promoted when an alert fires.' });
+      else if (prestageCount > 1) warnings.push({ sheet: 'Signals', message: `${prestageCount} signals marked [PRESTAGE] — only the first will be used.` });
+      parsed.signals = data;
+    }
+  }
+
+  if (errors.length > 0) return { ok: false, errors, warnings, parsed };
+  return { ok: true, errors: [], warnings, parsed };
+}
+
+function buildUploadedDataset(parsed, fileName) {
+  const c = parsed.company;
+
+  // ---- Company shape ----
+  const plants = ['Plant_1','Plant_2','Plant_3','Plant_4','Plant_5']
+    .map(k => c[k]).filter(Boolean)
+    .map((p, i) => {
+      const tokens = String(p).split(',').map(x => x.trim());
+      const city = tokens[0] || `Plant ${i + 1}`;
+      const country = tokens[tokens.length - 1] || '';
+      const state = tokens.length >= 3 ? tokens.slice(1, -1).join(', ') : '';
+      return { id: `P-${String(i + 1).padStart(2, '0')}`, city, state, country, capacity: 0.9, headcount: 0 };
+    });
+
+  const company = {
+    name: c.Company_Name,
+    ticker: c.Ticker || '',
+    industry: c.Industry || '',
+    revenue: c.Revenue_USD,
+    fy: c.Fiscal_Year ? String(c.Fiscal_Year) : 'FY2026',
+    employees: c.Employees || 0,
+    targets: {
+      grossMargin: (c.Gross_Margin_Target_Pct ?? 32) / 100,
+      ebitdaMargin: (c.EBITDA_Margin_Target_Pct ?? 14.5) / 100,
+      contingencyPct: (c.Contingency_Reserve_Pct ?? 4) / 100,
+      hedgeCoverage: (c.Hedge_Coverage_Pct ?? 70) / 100,
+      debtToEbitdaMax: 2.5,
+      wacc: 0.092,
+    },
+    currentGrossMargin: c.Gross_Margin_Current_Pct != null ? c.Gross_Margin_Current_Pct / 100 : null,
+    currentEbitdaMargin: c.EBITDA_Margin_Current_Pct != null ? c.EBITDA_Margin_Current_Pct / 100 : null,
+    contingencyReserveUsd: (c.Contingency_Reserve_Pct ?? 4) / 100 * (c.Operating_Expense_USD || 0),
+    activeSignalCount: c.Active_Signal_Count || null,
+    plants,
+  };
+
+  // ---- Budget lines + categories ----
+  const categoryNames = Array.from(new Set(parsed.budgetLines.map(l => l.Category)));
+  const palette = CHART_PALETTES['war-room'];
+  const budgetCategories = categoryNames.map((name, i) => ({
+    id: slugify(name, `cat${i}`), name, color: palette[i % palette.length],
+  }));
+  const catIdByName = Object.fromEntries(budgetCategories.map(c => [c.name, c.id]));
+
+  const budgetLines = parsed.budgetLines.map(l => ({
+    id: l.Line_ID,
+    name: l.Line_Name || l.Line_ID,
+    cat: catIdByName[l.Category],
+    fy25: typeof l.FY_Prior === 'number' ? l.FY_Prior : Math.round(l.FY_Current / (1 + (l.Escalation_Pct || 0))),
+    fy26: l.FY_Current,
+    esc: l.Escalation_Pct || 0,
+    sap: l.SAP_Source || '',
+    risk: 'standard',
+  }));
+  const budgetTotalFy25 = budgetLines.reduce((s, l) => s + l.fy25, 0);
+  const budgetTotalFy26 = budgetLines.reduce((s, l) => s + l.fy26, 0);
+
+  // ---- Suppliers ----
+  const suppliers = parsed.suppliers.map(s => {
+    const tokens = String(s.Location || '').split(',').map(x => x.trim());
+    const city = tokens[0] || '';
+    const country = tokens[tokens.length - 1] || '';
+    const regionCode = REGION_NAME_TO_CODE[s.Region] || slugify(s.Region, 'OT').slice(0, 2);
+    const materials = String(s.Materials || '').split(/[;,]/).map(x => x.trim()).filter(Boolean);
+    const exposed = String(s.Event_Exposed || '').trim().toUpperCase() === 'YES';
+    return {
+      id: s.Supplier_ID,
+      name: s.Supplier_Name || s.Supplier_ID,
+      region: regionCode,
+      city, country,
+      materials,
+      otd: (s.OTD_Pct || 0) / 100,
+      credit: s.Credit || 'BBB',
+      riskScore: s.Risk_Score,
+      spend: s.Annual_Spend_USD || 0,
+      plant: plants[0]?.id || 'P-01',
+      eventExposed: exposed,
+      hormuzExposed: false,
+    };
+  });
+
+  // ---- Regions (only the ones present) ----
+  const regions = {};
+  for (const sup of suppliers) {
+    if (!regions[sup.region]) {
+      const fullName = Object.entries(REGION_NAME_TO_CODE).find(([_, v]) => v === sup.region)?.[0] || sup.region;
+      regions[sup.region] = { name: fullName, cities: [] };
+    }
+  }
+  // Always have at least the codes present in the data; order them NA, EU, AS, ME, then rest
+  const orderedRegions = {};
+  for (const code of ['NA','EU','AS','ME','SA','OC','AF']) if (regions[code]) orderedRegions[code] = regions[code];
+  for (const code of Object.keys(regions)) if (!orderedRegions[code]) orderedRegions[code] = regions[code];
+
+  // ---- Events ----
+  const eventImpactsByEv = {};
+  for (const ei of (parsed.eventImpacts || [])) {
+    if (!eventImpactsByEv[ei.Event_ID]) eventImpactsByEv[ei.Event_ID] = [];
+    eventImpactsByEv[ei.Event_ID].push(ei);
+  }
+
+  const events = parsed.events.map(e => ({
+    id: e.Event_ID,
+    label: e.Event_Label,
+    severity: e.Severity || 'High',
+    region: e.Region || 'Global',
+    summary: e.AI_Summary || '',
+    aiBlurb: e.AI_Summary || '',
+    impactRange: {
+      min: Math.round((e.P10_M || 0) * 1_000_000),
+      mode: Math.round((e.P50_M || 0) * 1_000_000),
+      max: Math.round((e.P90_M || 0) * 1_000_000),
+    },
+    primaryDriver: 'event exposure',
+    affectedLineIds: (eventImpactsByEv[e.Event_ID] || []).map(ei => ei.Line_ID),
+    impactWeights: Object.fromEntries((eventImpactsByEv[e.Event_ID] || []).map(ei => [ei.Line_ID, ei.Impact_Weight])),
+    affectedSupplierTag: 'eventExposed',
+    detailedDrivers: [
+      { name: 'Primary driver',  weight: 0.60 },
+      { name: 'Secondary effect', weight: 0.25 },
+      { name: 'Tertiary effects', weight: 0.15 },
+    ],
+  }));
+  const eventById = Object.fromEntries(events.map(e => [e.id, e]));
+
+  // ---- Strategies + clauses ----
+  // Each clause string from the workbook becomes a clause entry. Per-strategy
+  // savings are split evenly across the strategy's clauses; feasibility +
+  // compliance are inherited from the strategy. If the same clause string
+  // appears across multiple strategies, the first occurrence wins.
+  const clauses = {};
+  const idCollisionCount = {};
+
+  function uniqueClauseId(name) {
+    const base = slugify(name).slice(0, 28);
+    const next = (idCollisionCount[base] || 0) + 1;
+    idCollisionCount[base] = next;
+    return next === 1 ? base : `${base}_${next}`;
+  }
+
+  function buildStrategyShape(s) {
+    const totalSavings = (s.Savings_P50_M || 0) * 1_000_000;
+    const clauseNames = String(s._clausesRaw || '').split(';').map(x => x.trim()).filter(Boolean);
+    const perClause = totalSavings / Math.max(1, clauseNames.length);
+    const compMap = {
+      usmca: String(s.USMCA || '').trim().toUpperCase() === 'PASS',
+      ofac:  String(s.OFAC  || '').trim().toUpperCase() === 'PASS',
+      ear:   String(s.EAR   || '').trim().toUpperCase() === 'PASS',
+    };
+    const feasibility = {
+      capacity:   String(s.Capacity   || 'green').trim().toLowerCase(),
+      leadTime:   String(s.Lead_Time  || 'green').trim().toLowerCase(),
+      compliance: String(s.Compliance || 'green').trim().toLowerCase(),
+    };
+    const clauseIds = clauseNames.map(name => {
+      // Reuse identical names across strategies
+      const existing = Object.values(clauses).find(c => c.name === name);
+      if (existing) return existing.id;
+      const id = uniqueClauseId(name);
+      clauses[id] = {
+        id, name,
+        savingsMin:  Math.round(perClause * 0.70),
+        savingsMode: Math.round(perClause),
+        savingsMax:  Math.round(perClause * 1.35),
+        feasibility, compliance: compMap,
+      };
+      return id;
+    });
+    const out = {
+      id: s.Strategy_ID,
+      name: s.Strategy_Name,
+      rationale: `Composable: ${clauseNames.join(', ')}.`,
+      clauses: clauseIds,
+      leadTimeDays: s.Lead_Days || 0,
+    };
+    if (s.Strategy_ID && s.Strategy_ID.toString().toUpperCase().startsWith('ALT-')) {
+      out.philosophy = 'alternative';
+    }
+    return out;
+  }
+
+  const allStrategies = parsed.strategies.map(buildStrategyShape);
+  const strategies            = allStrategies.filter(s => !s.id.toUpperCase().startsWith('ALT-'));
+  const alternativeStrategies = allStrategies.filter(s =>  s.id.toUpperCase().startsWith('ALT-'));
+
+  // ---- Signals ----
+  const firstEvId = events[0]?.id || 'EVENT';
+  const signalPool = parsed.signals.map(s => {
+    const text = String(s.Signal_Text || '');
+    const isPrestage = text.includes('[PRESTAGE]');
+    return {
+      type: String(s.Type || 'geo').toLowerCase(),
+      text: text.replace(/\s*\[PRESTAGE\]\s*/g, '').trim(),
+      confidence: String(s.Confidence || 'amber').toLowerCase(),
+      value: s.Value_Chip || undefined,
+      tagId: isPrestage ? `${firstEvId}_PRESTAGE` : undefined,
+    };
+  });
+
+  // ---- Activity feed seed ----
+  const recentActivity = [
+    { ts: fmtClock(), actor: 'System',  action: 'Loaded',    object: 'workbook',          detail: fileName },
+    { ts: fmtClock(), actor: 'System',  action: 'Validated', object: `${budgetLines.length} budget lines · ${suppliers.length} suppliers · ${events.length} events`, detail: 'no errors' },
+    { ts: fmtClock(), actor: 'System',  action: 'Indexed',   object: 'risk + impact tables', detail: 'ready' },
+  ];
+
+  return {
+    company, budgetCategories, budgetLines, budgetTotalFy25, budgetTotalFy26,
+    suppliers, regions: orderedRegions,
+    events, eventById,
+    strategies, alternativeStrategies, clauses,
+    signalPool, savedPlays: [], recentActivity,
+    source: {
+      type: 'upload', fileName,
+      companyName: company.name,
+      label: `Uploaded · ${fileName}`,
+    },
+  };
+}
+
+function parseAndValidateWorkbook(file) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onerror = () => resolve({ ok: false, errors: [{ sheet: '_file', message: 'Could not read file' }], warnings: [] });
+    reader.onload = (e) => {
+      let wb;
+      try {
+        wb = XLSX.read(e.target.result, { type: 'array' });
+      } catch (err) {
+        resolve({ ok: false, errors: [{ sheet: '_file', message: 'Could not parse Excel file. Ensure it is a valid .xlsx.' }], warnings: [] });
+        return;
+      }
+      const result = validateWorkbook(wb);
+      if (!result.ok) { resolve(result); return; }
+      try {
+        const data = buildUploadedDataset(result.parsed, file.name);
+        resolve({ ok: true, errors: [], warnings: result.warnings, data });
+      } catch (err) {
+        resolve({ ok: false, errors: [{ sheet: '_file', message: `Internal mapping error: ${err.message}` }], warnings: result.warnings });
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
 
 /* ============================================================================
  * SECTION 3: MONTE CARLO + SOLVER + UTILITIES
@@ -668,11 +1235,13 @@ function percentiles(sorted, ps = [0.10, 0.50, 0.90]) {
 }
 
 // ---------- Mock OR-Tools "solver" for clause composition ----------
-function solveStrategy(activeEvent, selectedClauses, multiEvent = false) {
+// `clausesMap` is the active dataset's clause dictionary. Passing it in keeps
+// the solver pure and lets uploaded data use its own clauses.
+function solveStrategy(activeEvent, selectedClauses, clausesMap, multiEvent = false) {
   // Deterministic: sum savings of selected clauses, apply interaction penalties
   let totalMin = 0, totalMode = 0, totalMax = 0;
   let capacity = 'green', leadTime = 'green', compliance = 'green';
-  const usedClauses = selectedClauses.map(id => CLAUSES[id]).filter(Boolean);
+  const usedClauses = selectedClauses.map(id => clausesMap?.[id]).filter(Boolean);
 
   for (const c of usedClauses) {
     totalMin += c.savingsMin;
@@ -893,9 +1462,43 @@ function isAIConfigured(provider, providerConfig) {
  * SECTION 5: ZUSTAND STORE
  * ========================================================================== */
 
+// Initial dataset on first render — always Meridian. Replaced via loadDataset
+// when the landing page completes either entry path.
+const INITIAL_DATA = buildMeridianDataset();
+
 const useWarRoom = create((set, get) => ({
+  // --- Active dataset (Meridian default OR uploaded). The whole app reads
+  //     from this. Never persisted; refresh restores Meridian. ---
+  data: INITIAL_DATA,
+  loadDataset: (newData) => {
+    // Replacing the active dataset resets everything that depended on it:
+    // current event, votes, applied strategy, audit log, etc.
+    set({
+      data: newData,
+      activeEventId: null,
+      secondaryEventId: null,
+      cascade: null,
+      selectedStrategyId: null,
+      selectedClauses: [],
+      strategyVotes: {},
+      proposalSet: 'primary',
+      reproposing: false,
+      applyingStrategy: false,
+      appliedStrategy: null,
+      strategyApplied: false,
+      counterfactualDays: 0,
+      multiEvent: false,
+      timeElapsedSec: 0,
+      alertFiredAt: null,
+      savedPlays: newData.savedPlays.map(p => ({ ...p, composition: [...p.composition] })),
+      auditLog: newData.recentActivity.map(a => ({ ...a })),
+      auditPing: 0,
+    });
+  },
+
   // --- Mode ---
-  mode: 'boot', // 'boot' | 'steady' | 'alert' | 'response'
+  // 'landing' (entry/upload) → 'boot' (5-step splash) → 'steady' → 'alert' → 'response'
+  mode: 'landing',
   setMode: (m) => set({ mode: m }),
 
   // --- Boot ---
@@ -906,14 +1509,15 @@ const useWarRoom = create((set, get) => ({
   activeEventId: null,
   secondaryEventId: null,
   fireAlert: (eventId) => {
-    const ev = EVENT_BY_ID[eventId];
+    const data = get().data;
+    const ev = data.eventById[eventId];
     if (!ev) return;
     set({
       activeEventId: eventId,
       mode: 'alert',
       alertFiredAt: Date.now(),
       timeElapsedSec: 0,
-      cascade: buildCascade(ev),
+      cascade: buildCascade(ev, data),
       selectedStrategyId: null,
       selectedClauses: [],            // Custom workspace starts empty — user composes by drag
       strategyVotes: {},              // Per-strategy votes reset per alert
@@ -934,8 +1538,11 @@ const useWarRoom = create((set, get) => ({
     get().pushAudit({ actor: 'CFO', action: 'Accepted', object: 'Alert briefing', detail: get().activeEventId });
   },
   fireSecondary: (eventId) => {
+    const data = get().data;
+    const ev = data.eventById[eventId];
+    if (!ev) return;
     set({ secondaryEventId: eventId });
-    get().pushAudit({ actor: 'System', action: 'Detected', object: EVENT_BY_ID[eventId].label, detail: 'Multi-event escalation' });
+    get().pushAudit({ actor: 'System', action: 'Detected', object: ev.label, detail: 'Multi-event escalation' });
   },
   reset: () => set({
     mode: 'steady',
@@ -970,7 +1577,8 @@ const useWarRoom = create((set, get) => ({
   selectedClauses: [],                  // Custom workspace contents (Path B)
   setStrategy: (id) => {
     set({ selectedStrategyId: id });
-    const s = [...STRATEGIES, ...ALTERNATIVE_STRATEGIES].find(x => x.id === id);
+    const data = get().data;
+    const s = [...data.strategies, ...data.alternativeStrategies].find(x => x.id === id);
     get().pushAudit({ actor: 'CFO', action: 'Highlighted', object: id, detail: s?.name || '' });
   },
   toggleClause: (clauseId) => {
@@ -978,13 +1586,13 @@ const useWarRoom = create((set, get) => ({
     const has = cur.includes(clauseId);
     const next = has ? cur.filter(c => c !== clauseId) : [...cur, clauseId];
     set({ selectedClauses: next });
-    get().pushAudit({ actor: 'CFO', action: has ? 'Removed' : 'Added', object: 'clause', detail: CLAUSES[clauseId]?.name || clauseId });
+    get().pushAudit({ actor: 'CFO', action: has ? 'Removed' : 'Added', object: 'clause', detail: get().data.clauses[clauseId]?.name || clauseId });
   },
   addClauseToCustom: (clauseId) => {
     const cur = get().selectedClauses;
     if (cur.includes(clauseId)) return;
     set({ selectedClauses: [...cur, clauseId] });
-    get().pushAudit({ actor: 'CFO', action: 'Composed', object: 'clause', detail: CLAUSES[clauseId]?.name || clauseId });
+    get().pushAudit({ actor: 'CFO', action: 'Composed', object: 'clause', detail: get().data.clauses[clauseId]?.name || clauseId });
   },
 
   // --- Stakeholder voting (per strategy id, plus 'CUSTOM' for the workspace) ---
@@ -997,7 +1605,8 @@ const useWarRoom = create((set, get) => ({
       }
     }));
     const labelMap = { CUSTOM: 'Custom Composition' };
-    const strat = [...STRATEGIES, ...ALTERNATIVE_STRATEGIES].find(x => x.id === strategyId);
+    const data = get().data;
+    const strat = [...data.strategies, ...data.alternativeStrategies].find(x => x.id === strategyId);
     get().pushAudit({ actor: role, action: value, object: strategyId, detail: labelMap[strategyId] || strat?.name || '' });
   },
 
@@ -1005,7 +1614,8 @@ const useWarRoom = create((set, get) => ({
   proposalSet: 'primary',
   reproposing: false,
   rejectAll: () => {
-    const visible = get().proposalSet === 'primary' ? STRATEGIES.slice(0, 3) : ALTERNATIVE_STRATEGIES;
+    const data = get().data;
+    const visible = get().proposalSet === 'primary' ? data.strategies.slice(0, 3) : data.alternativeStrategies;
     set(s => {
       const nextVotes = { ...s.strategyVotes };
       visible.forEach(strat => {
@@ -1033,13 +1643,16 @@ const useWarRoom = create((set, get) => ({
   applyingStrategy: false,
   appliedStrategy: null,
   applyStrategyById: (strategyId) => {
-    const all = [...STRATEGIES, ...ALTERNATIVE_STRATEGIES];
+    const data = get().data;
+    const all = [...data.strategies, ...data.alternativeStrategies];
     const s = all.find(x => x.id === strategyId);
     if (!s) return;
-    const ev = EVENT_BY_ID[get().activeEventId];
-    const result = ev ? solveStrategy(ev, s.clauses, get().multiEvent) : { savingsMode: 0 };
-    const baselineImpact = ev ? ev.impactRange.mode + (get().multiEvent ? (EVENT_BY_ID.CHINA_TARIFF?.impactRange.mode || 0) * 1.18 : 0) : 0;
+    const ev = data.eventById[get().activeEventId];
+    const ev2 = get().multiEvent ? data.eventById[get().secondaryEventId] : null;
+    const result = ev ? solveStrategy(ev, s.clauses, data.clauses, get().multiEvent) : { savingsMode: 0 };
+    const baselineImpact = ev ? ev.impactRange.mode + (ev2 ? ev2.impactRange.mode * 1.18 : 0) : 0;
     const mitigatedImpact = Math.max(0, baselineImpact - result.savingsMode);
+    const fy = data.company.fy;
     set({ applyingStrategy: true });
     setTimeout(() => {
       set(state => ({
@@ -1049,16 +1662,19 @@ const useWarRoom = create((set, get) => ({
         auditPing: state.auditPing + 1,
       }));
       get().pushAudit({ actor: 'CFO', action: 'Applied', object: s.id, detail: `${s.name} · ${s.clauses.length} clauses` });
-      get().pushAudit({ actor: 'System', action: 'Recomputed', object: 'FY2026 Budget Impact', detail: `${fmtUSD(-baselineImpact, { compact: true, precision: 1 })} → ${fmtUSD(-mitigatedImpact, { compact: true, precision: 1 })}` });
+      get().pushAudit({ actor: 'System', action: 'Recomputed', object: `${fy} Budget Impact`, detail: `${fmtUSD(-baselineImpact, { compact: true, precision: 1 })} → ${fmtUSD(-mitigatedImpact, { compact: true, precision: 1 })}` });
     }, 600);
   },
   applyCustomStrategy: () => {
+    const data = get().data;
     const clauses = get().selectedClauses;
     if (clauses.length === 0) return;
-    const ev = EVENT_BY_ID[get().activeEventId];
-    const result = ev ? solveStrategy(ev, clauses, get().multiEvent) : { savingsMode: 0 };
-    const baselineImpact = ev ? ev.impactRange.mode + (get().multiEvent ? (EVENT_BY_ID.CHINA_TARIFF?.impactRange.mode || 0) * 1.18 : 0) : 0;
+    const ev = data.eventById[get().activeEventId];
+    const ev2 = get().multiEvent ? data.eventById[get().secondaryEventId] : null;
+    const result = ev ? solveStrategy(ev, clauses, data.clauses, get().multiEvent) : { savingsMode: 0 };
+    const baselineImpact = ev ? ev.impactRange.mode + (ev2 ? ev2.impactRange.mode * 1.18 : 0) : 0;
     const mitigatedImpact = Math.max(0, baselineImpact - result.savingsMode);
+    const fy = data.company.fy;
     set({ applyingStrategy: true });
     setTimeout(() => {
       set(state => ({
@@ -1068,7 +1684,7 @@ const useWarRoom = create((set, get) => ({
         auditPing: state.auditPing + 1,
       }));
       get().pushAudit({ actor: 'CFO', action: 'Applied', object: 'CUSTOM', detail: `${clauses.length} clauses composed` });
-      get().pushAudit({ actor: 'System', action: 'Recomputed', object: 'FY2026 Budget Impact', detail: `${fmtUSD(-baselineImpact, { compact: true, precision: 1 })} → ${fmtUSD(-mitigatedImpact, { compact: true, precision: 1 })}` });
+      get().pushAudit({ actor: 'System', action: 'Recomputed', object: `${fy} Budget Impact`, detail: `${fmtUSD(-baselineImpact, { compact: true, precision: 1 })} → ${fmtUSD(-mitigatedImpact, { compact: true, precision: 1 })}` });
     }, 600);
   },
 
@@ -1080,8 +1696,12 @@ const useWarRoom = create((set, get) => ({
   toggleMultiEvent: () => {
     const next = !get().multiEvent;
     set({ multiEvent: next });
-    if (next && get().activeEventId === 'HORMUZ' && !get().secondaryEventId) {
-      get().fireSecondary('CHINA_TARIFF');
+    if (next && !get().secondaryEventId) {
+      // Pick the next event in the active dataset (whatever the primary is)
+      const data = get().data;
+      const primary = get().activeEventId;
+      const secondary = data.events.find(e => e.id !== primary);
+      if (secondary) get().fireSecondary(secondary.id);
     } else if (!next) {
       set({ secondaryEventId: null });
     }
@@ -1091,8 +1711,8 @@ const useWarRoom = create((set, get) => ({
   counterfactualDays: 0,
   setCounterfactualDays: (d) => set({ counterfactualDays: d }),
 
-  // --- Saved plays ---
-  savedPlays: [...SAVED_PLAYS],
+  // --- Saved plays — seeded from the active dataset, mutated in-session ---
+  savedPlays: INITIAL_DATA.savedPlays.map(p => ({ ...p, composition: [...p.composition] })),
   applySavedPlay: (playId) => {
     const p = get().savedPlays.find(x => x.id === playId);
     if (!p) return;
@@ -1100,13 +1720,14 @@ const useWarRoom = create((set, get) => ({
     get().pushAudit({ actor: 'CFO', action: 'Applied play', object: p.id, detail: p.name });
   },
   saveCurrentAsPlay: () => {
+    const data = get().data;
     const id = `PLAY-USR-${Date.now().toString(36).toUpperCase().slice(-5)}`;
-    const ev = EVENT_BY_ID[get().activeEventId];
+    const ev = data.eventById[get().activeEventId];
     const play = {
       id, name: `${ev?.label || 'Custom'} — saved`,
       date: new Date().toISOString().slice(0,10),
       crisis: ev?.label || '',
-      savings: solveStrategy(ev, get().selectedClauses, get().multiEvent).savingsMode,
+      savings: ev ? solveStrategy(ev, get().selectedClauses, data.clauses, get().multiEvent).savingsMode : 0,
       composition: [...get().selectedClauses],
       outcome: 'Session play',
     };
@@ -1114,8 +1735,8 @@ const useWarRoom = create((set, get) => ({
     get().pushAudit({ actor: 'CFO', action: 'Saved play', object: play.id, detail: play.name });
   },
 
-  // --- Audit log ---
-  auditLog: [...RECENT_ACTIVITY.map(a => ({ ...a }))],
+  // --- Audit log — seeded from the active dataset's recentActivity ---
+  auditLog: INITIAL_DATA.recentActivity.map(a => ({ ...a })),
   pushAudit: (entry) => set(s => ({ auditLog: [
     { ...entry, ts: entry.ts || fmtClock() },
     ...s.auditLog,
@@ -1191,30 +1812,32 @@ const useWarRoom = create((set, get) => ({
   },
 }));
 
-// Helper: default clauses for an event
-function CLAUSES_DEFAULT_FOR(event) {
-  if (event.id === 'HORMUZ')       return ['DUAL', 'HEDGE', 'PREBUILD'];
-  if (event.id === 'CHINA_TARIFF') return ['USMCA_SHIFT', 'PASSTHRU', 'HEDGE'];
-  if (event.id === 'USMCA_AUDIT')  return ['RENEGOTIATE', 'HEDGE'];
-  return ['DUAL', 'HEDGE'];
-}
-
 /* ============================================================================
  * SECTION 6: BOOT SEQUENCE
  * ========================================================================== */
 
-const BOOT_LINES = [
-  { label: 'Connecting to Datasphere',           detail: 'sap-cds://prod.datasphere.americas/'   },
-  { label: 'Loading 240 suppliers',              detail: 'Suppliers_BV · materialized: 02:14 UTC' },
-  { label: 'Indexing 60 budget lines',           detail: 'GL_Balances_BV · FY2026 baseline'      },
-  { label: 'Spinning up Databricks ML cluster',  detail: 'dbx-cluster · 4× r5.4xlarge · driver up' },
-  { label: 'War Room Ready',                     detail: 'all systems nominal'                    },
-];
+function buildBootLines(data) {
+  const isUpload = data.source.type === 'upload';
+  return [
+    { label: isUpload ? 'Reading uploaded workbook' : 'Connecting to Datasphere',
+      detail: isUpload ? `${data.source.fileName}` : 'sap-cds://prod.datasphere.americas/' },
+    { label: `Loading ${data.suppliers.length.toLocaleString()} suppliers`,
+      detail: isUpload ? 'Suppliers · validated' : 'Suppliers_BV · materialized: 02:14 UTC' },
+    { label: `Indexing ${data.budgetLines.length} budget lines`,
+      detail: `${isUpload ? 'Budget_Lines' : 'GL_Balances_BV'} · ${data.company.fy} baseline` },
+    { label: 'Spinning up Databricks ML cluster',
+      detail: 'dbx-cluster · 4× r5.4xlarge · driver up' },
+    { label: 'War Room Ready',
+      detail: 'all systems nominal' },
+  ];
+}
 
 function BootSequence() {
   const setMode = useWarRoom(s => s.setMode);
   const setBootSteps = useWarRoom(s => s.setBootSteps);
   const skipBoot = useWarRoom(s => s.skipBoot);
+  const data = useWarRoom(s => s.data);
+  const bootLines = useMemo(() => buildBootLines(data), [data]);
   const [step, setStep] = useState(0);
 
   useEffect(() => {
@@ -1228,7 +1851,7 @@ function BootSequence() {
       if (cancelled) return;
       setStep(i);
       setBootSteps(i);
-      if (i >= BOOT_LINES.length) {
+      if (i >= bootLines.length) {
         setTimeout(() => !cancelled && setMode('steady'), 480);
       } else {
         setTimeout(() => next(i + 1), stepDelay);
@@ -1236,7 +1859,7 @@ function BootSequence() {
     }
     next(1);
     return () => { cancelled = true; };
-  }, [skipBoot, setBootSteps, setMode]);
+  }, [skipBoot, setBootSteps, setMode, bootLines.length]);
 
   // Esc skips boot
   useEffect(() => {
@@ -1268,7 +1891,7 @@ function BootSequence() {
         </div>
 
         <div className="space-y-3 font-mono text-[13px]">
-          {BOOT_LINES.map((line, i) => {
+          {bootLines.map((line, i) => {
             const done = i < step;
             const active = i === step - 1;
             return (
@@ -1426,80 +2049,108 @@ function GroundedNumber({
  * SECTION 8: LINEAGE DRAWER
  * ========================================================================== */
 
-const LINEAGE_QUERIES = {
-  budget_total: {
-    title: 'FY2026 Operating Budget — Total',
-    sql: `-- Databricks · Datasphere passthrough
+function buildLineageQueries(data) {
+  const { company, budgetCategories, budgetLines, budgetTotalFy26, suppliers, events, source } = data;
+  const fy = company.fy;
+  const sourceTag = source.type === 'upload'
+    ? `Source: uploaded workbook · ${source.fileName}`
+    : 'Source: Datasphere CDS views (mock)';
+  const firstEvent = events[0];
+  const contingencyUsd = company.contingencyReserveUsd ?? (company.targets.contingencyPct * budgetTotalFy26);
+  const projectedEbitda = company.currentEbitdaMargin ?? 0.139;
+  const ebitdaVariance = projectedEbitda - company.targets.ebitdaMargin;
+
+  return {
+    budget_total: {
+      title: `${fy} Operating Budget — Total`,
+      sql: `-- ${sourceTag}
 SELECT
-  SUM(gl.fy26_baseline_usd) AS total_opex,
-  COUNT(DISTINCT gl.gl_account) AS line_items
-FROM datasphere.Suppliers_BV s
-JOIN datasphere.GL_Balances_BV gl
-  ON s.gl_account = gl.gl_account
-WHERE gl.fiscal_year = 'FY2026'
-  AND gl.legal_entity = 'MDS-US-01';`,
-    rows: BUDGET_LINES.slice(0, 8).map(l => ({ gl: l.sap.split(' ').pop(), name: l.name, fy26: l.fy26 })),
-    model: { name: 'budget-aggregator-v1.4', type: 'OR-Tools constraint LP', features: 'fy25 actual, escalation %, hedge coverage', retrain: 'monthly · last 14 days', window: '36-month rolling' },
-  },
-  budget_donut: {
-    title: 'FY2026 Budget by Category',
-    sql: `SELECT category, SUM(fy26_baseline_usd) AS total
-FROM datasphere.GL_Balances_BV
-WHERE fiscal_year = 'FY2026' GROUP BY category;`,
-    rows: BUDGET_CATEGORIES.map(c => ({ category: c.name, total: BUDGET_LINES.filter(l => l.cat === c.id).reduce((s,l)=>s+l.fy26,0) })),
-    model: { name: 'budget-aggregator-v1.4', type: 'Aggregation', features: 'category mapping', retrain: 'on-update', window: 'live' },
-  },
-  margin: {
-    title: 'Gross Margin Projection',
-    sql: `SELECT (rev.total - opex.total) / rev.total AS margin
-FROM (SELECT SUM(fy26_revenue_usd) AS total FROM datasphere.Sales_BV WHERE fy='FY2026') rev,
-     (SELECT SUM(fy26_baseline_usd) AS total FROM datasphere.GL_Balances_BV WHERE fy='FY2026') opex;`,
-    rows: [{ metric: 'Revenue', value: COMPANY.revenue }, { metric: 'OpEx', value: BUDGET_TOTAL_FY26 }, { metric: 'Gross Margin', value: ((COMPANY.revenue - BUDGET_TOTAL_FY26)/COMPANY.revenue) }],
-    model: { name: 'margin-projector-v3.1', type: 'Bayesian regression', features: 'revenue forecast, opex baseline, hedge coverage', retrain: 'weekly · Tue 04:00 UTC', window: '60-month' },
-  },
-  ebitda: {
-    title: 'EBITDA Margin (FY2026)',
-    sql: `WITH p AS (
-  SELECT ebitda_baseline_usd FROM datasphere.PnL_BV WHERE fy='FY2026'
-) SELECT ebitda_baseline_usd / 195000000 AS ebitda_margin FROM p;`,
-    rows: [{ metric: 'Target', value: COMPANY.targets.ebitdaMargin }, { metric: 'Projected', value: 0.139 }, { metric: 'Variance', value: -0.006 }],
-    model: { name: 'pnl-projector-v2.6', type: 'XGBoost', features: 'opex, revenue mix, FX, hedge coverage', retrain: 'weekly', window: '48-month' },
-  },
-  contingency: {
-    title: 'Contingency Reserve',
-    sql: `SELECT reserve_usd, reserve_usd / opex_total AS pct
-FROM datasphere.Treasury_BV WHERE fy='FY2026';`,
-    rows: [{ metric: 'Reserve', value: 4_800_000 }, { metric: 'OpEx', value: BUDGET_TOTAL_FY26 }, { metric: '% of OpEx', value: 4_800_000 / BUDGET_TOTAL_FY26 }],
-    model: { name: 'treasury-recon-v1.0', type: 'Rule-based', features: 'cash, credit lines, accruals', retrain: 'daily', window: 'live' },
-  },
-  hormuz_impact: {
-    title: 'Strait of Hormuz — P50 Impact',
-    sql: `SELECT SUM(impact_usd_mode) AS p50_impact
-FROM databricks.event_impact
-WHERE event_id = 'HORMUZ' AND scenario_horizon_days = 90;`,
-    rows: EVENTS[0].affectedLineIds.map(id => {
-      const l = BUDGET_LINES.find(x => x.id === id);
-      return { line: l.name, baseline: l.fy26, est_impact: Math.round(l.fy26 * 0.045) };
-    }),
-    model: { name: 'event-impact-bayes-v2.7', type: 'Bayesian regression', features: 'tariff rate, FX, demand elasticity, hedge coverage', retrain: 'event-triggered', window: '24-month' },
-  },
-  risk_score: {
-    title: 'Composite Risk Score',
-    sql: `SELECT supplier_id, name, region, composite_risk_score
-FROM datasphere.Suppliers_BV
+  SUM(gl.fy_current_usd) AS total_opex,
+  COUNT(DISTINCT gl.line_id) AS line_items
+FROM ${source.type === 'upload' ? 'workbook.Budget_Lines' : 'datasphere.GL_Balances_BV'}
+WHERE gl.fiscal_year = '${fy}'
+  AND gl.entity = '${company.name}';`,
+      rows: budgetLines.slice(0, 8).map(l => ({ gl: (l.sap || '').split(' ').pop() || l.id, name: l.name, fy_current: l.fy26 })),
+      model: { name: 'budget-aggregator-v1.4', type: 'OR-Tools constraint LP', features: 'fy_prior, escalation %, hedge coverage', retrain: 'monthly · last 14 days', window: '36-month rolling' },
+    },
+    budget_donut: {
+      title: `${fy} Budget by Category`,
+      sql: `SELECT category, SUM(fy_current_usd) AS total
+FROM ${source.type === 'upload' ? 'workbook.Budget_Lines' : 'datasphere.GL_Balances_BV'}
+WHERE fiscal_year = '${fy}' GROUP BY category;`,
+      rows: budgetCategories.map(c => ({ category: c.name, total: budgetLines.filter(l => l.cat === c.id).reduce((s, l) => s + l.fy26, 0) })),
+      model: { name: 'budget-aggregator-v1.4', type: 'Aggregation', features: 'category mapping', retrain: 'on-update', window: 'live' },
+    },
+    margin: {
+      title: 'Gross Margin Projection',
+      sql: `SELECT (rev.total - opex.total) / rev.total AS margin
+FROM (SELECT SUM(revenue_usd) AS total FROM ${source.type === 'upload' ? 'workbook.Company' : 'datasphere.Sales_BV'} WHERE fy='${fy}') rev,
+     (SELECT SUM(fy_current_usd) AS total FROM ${source.type === 'upload' ? 'workbook.Budget_Lines' : 'datasphere.GL_Balances_BV'} WHERE fy='${fy}') opex;`,
+      rows: [
+        { metric: 'Revenue', value: company.revenue },
+        { metric: 'OpEx',    value: budgetTotalFy26 },
+        { metric: 'Gross Margin', value: company.revenue > 0 ? (company.revenue - budgetTotalFy26) / company.revenue : 0 },
+      ],
+      model: { name: 'margin-projector-v3.1', type: 'Bayesian regression', features: 'revenue forecast, opex baseline, hedge coverage', retrain: 'weekly · Tue 04:00 UTC', window: '60-month' },
+    },
+    ebitda: {
+      title: `EBITDA Margin (${fy})`,
+      sql: `WITH p AS (
+  SELECT ebitda_baseline_usd FROM ${source.type === 'upload' ? 'workbook.Company' : 'datasphere.PnL_BV'} WHERE fy='${fy}'
+) SELECT ebitda_baseline_usd / ${company.revenue} AS ebitda_margin FROM p;`,
+      rows: [
+        { metric: 'Target',    value: company.targets.ebitdaMargin },
+        { metric: 'Projected', value: projectedEbitda },
+        { metric: 'Variance',  value: ebitdaVariance },
+      ],
+      model: { name: 'pnl-projector-v2.6', type: 'XGBoost', features: 'opex, revenue mix, FX, hedge coverage', retrain: 'weekly', window: '48-month' },
+    },
+    contingency: {
+      title: 'Contingency Reserve',
+      sql: `SELECT reserve_usd, reserve_usd / opex_total AS pct
+FROM ${source.type === 'upload' ? 'workbook.Company' : 'datasphere.Treasury_BV'} WHERE fy='${fy}';`,
+      rows: [
+        { metric: 'Reserve',   value: contingencyUsd },
+        { metric: 'OpEx',      value: budgetTotalFy26 },
+        { metric: '% of OpEx', value: budgetTotalFy26 > 0 ? contingencyUsd / budgetTotalFy26 : 0 },
+      ],
+      model: { name: 'treasury-recon-v1.0', type: 'Rule-based', features: 'cash, credit lines, accruals', retrain: 'daily', window: 'live' },
+    },
+    hormuz_impact: {
+      title: firstEvent ? `${firstEvent.label} — P50 Impact` : 'Event — P50 Impact',
+      sql: firstEvent ? `SELECT SUM(impact_usd_mode) AS p50_impact
+FROM ${source.type === 'upload' ? 'workbook.Event_Impacts' : 'databricks.event_impact'}
+WHERE event_id = '${firstEvent.id}' AND scenario_horizon_days = 90;` : '-- no event loaded',
+      rows: firstEvent ? firstEvent.affectedLineIds.map(id => {
+        const l = budgetLines.find(x => x.id === id);
+        if (!l) return null;
+        const weight = firstEvent.impactWeights?.[id] ?? 0.045;
+        const impactRate = source.type === 'upload' ? Math.min(0.15, weight * 0.06) : 0.045;
+        return { line: l.name, baseline: l.fy26, est_impact: Math.round(l.fy26 * impactRate) };
+      }).filter(Boolean) : [],
+      model: { name: 'event-impact-bayes-v2.7', type: 'Bayesian regression', features: 'tariff rate, FX, demand elasticity, hedge coverage', retrain: 'event-triggered', window: '24-month' },
+    },
+    risk_score: {
+      title: 'Composite Risk Score',
+      sql: `SELECT supplier_id, name, region, composite_risk_score
+FROM ${source.type === 'upload' ? 'workbook.Suppliers' : 'datasphere.Suppliers_BV'}
 ORDER BY composite_risk_score DESC LIMIT 20;`,
-    rows: [...SUPPLIERS].sort((a,b) => b.riskScore - a.riskScore).slice(0, 12).map(s => ({ id: s.id, name: s.name, region: s.region, score: s.riskScore })),
-    model: { name: 'supplier-risk-iforest-v3.2', type: 'Isolation Forest', features: 'credit, OTD, region, geopolitical exposure', retrain: 'weekly', window: '24-month rolling' },
-  },
-};
+      rows: [...suppliers].sort((a, b) => b.riskScore - a.riskScore).slice(0, 12).map(s => ({ id: s.id, name: s.name, region: s.region, score: s.riskScore })),
+      model: { name: 'supplier-risk-iforest-v3.2', type: 'Isolation Forest', features: 'credit, OTD, region, geopolitical exposure', retrain: 'weekly', window: '24-month rolling' },
+    },
+    _sourceTag: sourceTag,
+  };
+}
 
 function LineageDrawer() {
-  const { lineageOpen, lineageContext, closeLineage } = useWarRoom(s => ({
-    lineageOpen: s.lineageOpen, lineageContext: s.lineageContext, closeLineage: s.closeLineage
+  const { lineageOpen, lineageContext, closeLineage, data } = useWarRoom(s => ({
+    lineageOpen: s.lineageOpen, lineageContext: s.lineageContext, closeLineage: s.closeLineage,
+    data: s.data,
   }));
 
   if (!lineageOpen) return null;
-  const data = LINEAGE_QUERIES[lineageContext?.id] || LINEAGE_QUERIES.budget_total;
+  const queries = buildLineageQueries(data);
+  const lineage = queries[lineageContext?.id] || queries.budget_total;
 
   return (
     <>
@@ -1508,7 +2159,7 @@ function LineageDrawer() {
         <div className="sticky top-0 bg-ink-100/95 backdrop-blur hairline-b px-6 py-4 flex items-center justify-between z-10">
           <div>
             <div className="text-[10px] uppercase tracking-[0.24em] text-paper-500">Data Lineage</div>
-            <div className="font-display text-lg text-paper-50 mt-0.5">{data.title}</div>
+            <div className="font-display text-lg text-paper-50 mt-0.5">{lineage.title}</div>
           </div>
           <button onClick={closeLineage} className="hairline px-2 py-1.5 hover:bg-ink-300 transition-colors">
             <X size={14} />
@@ -1518,24 +2169,28 @@ function LineageDrawer() {
         <div className="p-6 space-y-6">
           <section>
             <SectionLabel>Simulated Databricks query</SectionLabel>
-            <pre className="mt-2 hairline bg-ink-50 p-4 font-mono text-[11px] leading-relaxed text-paper-200 overflow-x-auto whitespace-pre">{data.sql}</pre>
-            <div className="mt-2 text-[10px] text-paper-500 font-mono">Datasphere CDS views: Suppliers_BV · BOM_Header_BV · GL_Balances_BV · Freight_Lanes_BV</div>
+            <pre className="mt-2 hairline bg-ink-50 p-4 font-mono text-[11px] leading-relaxed text-paper-200 overflow-x-auto whitespace-pre">{lineage.sql}</pre>
+            <div className="mt-2 text-[10px] text-paper-500 font-mono">
+              {data.source.type === 'upload'
+                ? `Source: ${data.source.fileName} · 8 sheets · validated`
+                : 'Datasphere CDS views: Suppliers_BV · BOM_Header_BV · GL_Balances_BV · Freight_Lanes_BV'}
+            </div>
           </section>
 
           <section>
-            <SectionLabel right={`${data.rows.length} rows`}>Underlying records (sample)</SectionLabel>
+            <SectionLabel right={`${lineage.rows.length} rows`}>Underlying records (sample)</SectionLabel>
             <div className="mt-2 hairline overflow-hidden">
               <table className="w-full text-[12px] font-mono">
                 <thead className="bg-ink-200 text-paper-400 text-[10px] uppercase tracking-[0.16em]">
-                  <tr>{Object.keys(data.rows[0]).map(k => <th key={k} className="text-left px-3 py-2">{k}</th>)}</tr>
+                  <tr>{lineage.rows[0] && Object.keys(lineage.rows[0]).map(k => <th key={k} className="text-left px-3 py-2">{k}</th>)}</tr>
                 </thead>
                 <tbody>
-                  {data.rows.map((r, i) => (
+                  {lineage.rows.map((r, i) => (
                     <tr key={i} className={i % 2 ? 'bg-ink-200/40' : ''}>
                       {Object.entries(r).map(([k, v]) => (
                         <td key={k} className="px-3 py-2 text-paper-100">
-                          {typeof v === 'number' && k.includes('value') && k !== 'fy26' ? (Math.abs(v) < 1 ? fmtPct(v) : fmtUSD(v, { compact: true })) :
-                           typeof v === 'number' && (k.includes('impact') || k.includes('baseline') || k === 'fy26' || k === 'total' || k === 'spend') ? fmtUSD(v, { compact: true }) :
+                          {typeof v === 'number' && k.includes('value') && k !== 'fy_current' ? (Math.abs(v) < 1 ? fmtPct(v) : fmtUSD(v, { compact: true })) :
+                           typeof v === 'number' && (k.includes('impact') || k.includes('baseline') || k === 'fy_current' || k === 'fy26' || k === 'total' || k === 'spend') ? fmtUSD(v, { compact: true }) :
                            typeof v === 'number' && k === 'score' ? v.toFixed(0) :
                            String(v)}
                         </td>
@@ -1552,23 +2207,23 @@ function LineageDrawer() {
             <div className="mt-2 hairline p-4 space-y-2 bg-ink-200/40">
               <div className="flex items-center justify-between">
                 <div>
-                  <div className="font-mono text-[13px] text-paper-50">{data.model.name}</div>
-                  <div className="text-[10px] uppercase tracking-[0.18em] text-paper-500 mt-0.5">{data.model.type}</div>
+                  <div className="font-mono text-[13px] text-paper-50">{lineage.model.name}</div>
+                  <div className="text-[10px] uppercase tracking-[0.18em] text-paper-500 mt-0.5">{lineage.model.type}</div>
                 </div>
                 <Pill color="info" size="xs">Production</Pill>
               </div>
               <div className="grid grid-cols-2 gap-3 text-[11px] mt-3">
                 <div>
                   <div className="text-[9px] uppercase tracking-[0.2em] text-paper-500">Features</div>
-                  <div className="text-paper-200 mt-0.5">{data.model.features}</div>
+                  <div className="text-paper-200 mt-0.5">{lineage.model.features}</div>
                 </div>
                 <div>
                   <div className="text-[9px] uppercase tracking-[0.2em] text-paper-500">Training window</div>
-                  <div className="text-paper-200 mt-0.5 font-mono">{data.model.window}</div>
+                  <div className="text-paper-200 mt-0.5 font-mono">{lineage.model.window}</div>
                 </div>
                 <div>
                   <div className="text-[9px] uppercase tracking-[0.2em] text-paper-500">Retrain cadence</div>
-                  <div className="text-paper-200 mt-0.5 font-mono">{data.model.retrain}</div>
+                  <div className="text-paper-200 mt-0.5 font-mono">{lineage.model.retrain}</div>
                 </div>
                 <div>
                   <div className="text-[9px] uppercase tracking-[0.2em] text-paper-500">Decision boundary</div>
@@ -1605,12 +2260,13 @@ function LineageDrawer() {
  * ========================================================================== */
 
 function Header() {
-  const { mode, activeEventId, secondaryEventId, timeElapsedSec, multiEvent } = useWarRoom(s => ({
+  const { mode, activeEventId, secondaryEventId, timeElapsedSec, multiEvent, data } = useWarRoom(s => ({
     mode: s.mode, activeEventId: s.activeEventId, secondaryEventId: s.secondaryEventId,
     timeElapsedSec: s.timeElapsedSec, multiEvent: s.multiEvent,
+    data: s.data,
   }));
   const showCounter = mode === 'alert' || mode === 'response';
-  const event = activeEventId ? EVENT_BY_ID[activeEventId] : null;
+  const event = activeEventId ? data.eventById[activeEventId] : null;
 
   return (
     <header className="relative z-30 hairline-b bg-ink-100/80 backdrop-blur">
@@ -1620,12 +2276,12 @@ function Header() {
           <Logo size={26} />
           <div className="leading-none">
             <div className="font-display text-[19px] text-paper-50 tracking-tight">Black Swan</div>
-            <div className="text-[9px] uppercase tracking-[0.28em] text-paper-500 mt-1">War Room · {COMPANY.fy}</div>
+            <div className="text-[9px] uppercase tracking-[0.28em] text-paper-500 mt-1">War Room · {data.company.fy}</div>
           </div>
           <div className="hairline-l h-7 mx-2" />
           <div className="leading-tight">
-            <div className="text-[11px] text-paper-200">{COMPANY.name}</div>
-            <div className="text-[9px] uppercase tracking-[0.2em] text-paper-500 mt-0.5">{COMPANY.ticker}</div>
+            <div className="text-[11px] text-paper-200">{data.company.name}</div>
+            <div className="text-[9px] uppercase tracking-[0.2em] text-paper-500 mt-0.5">{data.company.ticker}</div>
           </div>
         </div>
 
@@ -1648,7 +2304,7 @@ function Header() {
               </div>
               {event && (
                 <div className="mt-1 text-[10px] uppercase tracking-[0.18em] text-paper-400 font-mono">
-                  {event.label}{multiEvent && secondaryEventId ? ` × ${EVENT_BY_ID[secondaryEventId].label.split('(')[0].trim()}` : ''}
+                  {event.label}{multiEvent && secondaryEventId ? ` × ${data.eventById[secondaryEventId]?.label.split('(')[0].trim()}` : ''}
                 </div>
               )}
             </div>
@@ -1800,37 +2456,45 @@ function SavedPlaysDropdown() {
 }
 
 function KPIStrip() {
-  // Compute KPIs from baseline
-  const opex = BUDGET_TOTAL_FY26;
-  const margin = (COMPANY.revenue - opex) / COMPANY.revenue;
-  const ebitda = 0.139; // mocked
-  const contingencyPct = 4_800_000 / opex;
-  const riskScore = Math.round(SUPPLIERS.reduce((s, x) => s + x.riskScore, 0) / SUPPLIERS.length);
+  const { mode, data } = useWarRoom(s => ({ mode: s.mode, data: s.data }));
+  const opex = data.budgetTotalFy26;
+  const margin = data.company.revenue > 0 ? (data.company.revenue - opex) / data.company.revenue : 0;
+  const ebitda = data.company.currentEbitdaMargin ?? 0.139;
+  const contingencyUsd = data.company.contingencyReserveUsd ?? (data.company.targets.contingencyPct * opex);
+  const contingencyPct = opex > 0 ? contingencyUsd / opex : 0;
+  const riskScore = data.suppliers.length ? Math.round(data.suppliers.reduce((s, x) => s + x.riskScore, 0) / data.suppliers.length) : 0;
+  // Active signals = red + amber from the live pool (subject to upload override)
+  const activeSignals = data.company.activeSignalCount ?? data.signalPool.filter(s => s.confidence !== 'green').length;
 
-  const activeSignals = 12; // count of red+amber in signal feed
-  const mode = useWarRoom(s => s.mode);
+  const opexDelta = data.budgetTotalFy25 > 0
+    ? `+${fmtPct((opex - data.budgetTotalFy25) / data.budgetTotalFy25, 1)} vs FY prior`
+    : '—';
+  const marginGap = (margin - data.company.targets.grossMargin) * 10000; // bps
+  const marginDelta = marginGap >= 0 ? `+${Math.round(marginGap)}bps to target` : `${Math.round(marginGap)}bps to target`;
+  const ebitdaGap = (ebitda - data.company.targets.ebitdaMargin) * 10000;
+  const ebitdaDelta = ebitdaGap >= 0 ? `+${Math.round(ebitdaGap)}bps to target` : `${Math.round(ebitdaGap)}bps to target`;
 
   return (
     <div className="hairline-t bg-ink-50/60 px-5 py-2.5 grid grid-cols-5 gap-px">
       <KPITile
-        label="Total OpEx (FY26)" sub="Baseline · 60 lines"
+        label={`Total OpEx (${data.company.fy})`} sub={`Baseline · ${data.budgetLines.length} lines`}
         value={<GroundedNumber value={opex} compact precision={1} size="md" label="Total OpEx" lineageId="budget_total" />}
-        delta="+4.1% vs FY25" deltaColor="amber"
+        delta={opexDelta} deltaColor="amber"
       />
       <KPITile
-        label="Gross Margin" sub={`Target ${fmtPct(COMPANY.targets.grossMargin, 0)}`}
+        label="Gross Margin" sub={`Target ${fmtPct(data.company.targets.grossMargin, 0)}`}
         value={<GroundedNumber value={margin} format="pct" precision={1} size="md" label="Gross Margin" lineageId="margin" />}
-        delta="-80bps to target" deltaColor="amber"
+        delta={marginDelta} deltaColor={marginGap >= 0 ? 'stable' : 'amber'}
       />
       <KPITile
-        label="EBITDA Margin" sub={`Target ${fmtPct(COMPANY.targets.ebitdaMargin, 1)}`}
+        label="EBITDA Margin" sub={`Target ${fmtPct(data.company.targets.ebitdaMargin, 1)}`}
         value={<GroundedNumber value={ebitda} format="pct" precision={1} size="md" label="EBITDA Margin" lineageId="ebitda" />}
-        delta="-60bps to target" deltaColor="amber"
+        delta={ebitdaDelta} deltaColor={ebitdaGap >= 0 ? 'stable' : 'amber'}
       />
       <KPITile
         label="Contingency Reserve" sub="As % of OpEx"
         value={<GroundedNumber value={contingencyPct} format="pct" precision={1} size="md" label="Contingency" lineageId="contingency" />}
-        delta={fmtUSD(4_800_000, { compact: true })} deltaColor="stable"
+        delta={fmtUSD(contingencyUsd, { compact: true })} deltaColor="stable"
       />
       <KPITile
         label="Active Signals" sub={`Avg supplier risk: ${riskScore}`}
@@ -1866,14 +2530,17 @@ function KPITile({ label, sub, value, delta, deltaColor = 'paper' }) {
  * ========================================================================== */
 
 function SignalSidebar() {
-  const { mode, activeEventId, showConnectionLines } = useWarRoom(s => ({
-    mode: s.mode, activeEventId: s.activeEventId, showConnectionLines: s.showConnectionLines
+  const { mode, activeEventId, showConnectionLines, signalPool } = useWarRoom(s => ({
+    mode: s.mode, activeEventId: s.activeEventId, showConnectionLines: s.showConnectionLines,
+    signalPool: s.data.signalPool,
   }));
   const [items, setItems] = useState(() => {
-    // Seed with 16 items; the Hormuz pre-stage gets reserved for slot 5
+    // Seed with up to 16 items; any pre-stage signal is held back until alert fires
     const initial = [];
-    const pool = [...SIGNAL_POOL];
-    for (let i = 0; i < 16; i++) {
+    const pool = signalPool.filter(s => !s.tagId || !s.tagId.endsWith('_PRESTAGE'));
+    if (pool.length === 0) return initial;
+    const count = Math.min(16, pool.length * 2);
+    for (let i = 0; i < count; i++) {
       const idx = (i * 3) % pool.length;
       initial.push({ ...pool[idx], key: `init-${i}`, age: 60 + i * 4 });
     }
@@ -1885,34 +2552,34 @@ function SignalSidebar() {
   useEffect(() => {
     const t = setInterval(() => {
       setItems(cur => {
+        if (signalPool.length === 0) return cur;
         const next = [...cur];
-        const sourceIdx = Math.floor(Math.random() * SIGNAL_POOL.length);
-        const item = { ...SIGNAL_POOL[sourceIdx], key: `tick-${Date.now()}-${sourceIdx}`, age: 0 };
+        const sourceIdx = Math.floor(Math.random() * signalPool.length);
+        const item = { ...signalPool[sourceIdx], key: `tick-${Date.now()}-${sourceIdx}`, age: 0 };
         // Skip the pre-stage one in periodic mode
-        if (item.tagId === 'HORMUZ_PRESTAGE') return cur;
+        if (item.tagId && item.tagId.endsWith('_PRESTAGE')) return cur;
         next.unshift(item);
         if (next.length > 22) next.pop();
         return next.map(x => ({ ...x, age: x.age + 8 }));
       });
     }, 8500);
     return () => clearInterval(t);
-  }, []);
+  }, [signalPool]);
 
-  // When alert fires, move the Hormuz item to top and pulse
+  // When alert fires, promote the prestaged signal for that event (or first red signal)
   useEffect(() => {
     if (mode !== 'alert' && mode !== 'response') return;
-    const eventTagMap = {
-      HORMUZ: 'HORMUZ_PRESTAGE',
-    };
-    const tag = eventTagMap[activeEventId];
-    if (!tag) return;
+    if (!activeEventId) return;
+    const wanted = `${activeEventId}_PRESTAGE`;
+    let prestaged = signalPool.find(s => s.tagId === wanted);
+    if (!prestaged) prestaged = signalPool.find(s => s.confidence === 'red');
+    if (!prestaged) return;
     setItems(cur => {
-      const hormuz = SIGNAL_POOL.find(s => s.tagId === tag);
-      const without = cur.filter(x => x.tagId !== tag);
-      return [{ ...hormuz, key: `alert-${Date.now()}`, age: 0, pulsing: true }, ...without];
+      const without = cur.filter(x => x.tagId !== prestaged.tagId);
+      return [{ ...prestaged, key: `alert-${Date.now()}`, age: 0, pulsing: true }, ...without];
     });
     setPulseKey(k => k + 1);
-  }, [mode, activeEventId]);
+  }, [mode, activeEventId, signalPool]);
 
   return (
     <aside className="w-[240px] flex-none hairline-r bg-ink-100/40 flex flex-col h-full relative" id="signal-sidebar">
@@ -2067,27 +2734,32 @@ function SteadyState() {
 
 function BudgetPanel() {
   // Theme-aware palette — donut + legend swatches re-color on theme switch
-  const theme = useWarRoom(s => s.theme);
+  const { theme, data } = useWarRoom(s => ({ theme: s.theme, data: s.data }));
   const palette = CHART_PALETTES[theme] || CHART_PALETTES['war-room'];
-  const catSums = useMemo(() => BUDGET_CATEGORIES.map((c, i) => ({
+  const catSums = useMemo(() => data.budgetCategories.map((c, i) => ({
     ...c,
     color: palette[i % palette.length],
-    total: BUDGET_LINES.filter(l => l.cat === c.id).reduce((s, l) => s + l.fy26, 0),
-  })).sort((a, b) => b.total - a.total), [palette]);
+    total: data.budgetLines.filter(l => l.cat === c.id).reduce((s, l) => s + l.fy26, 0),
+  })).sort((a, b) => b.total - a.total), [palette, data]);
+
+  const fy = data.company.fy;
+  const opex = data.budgetTotalFy26;
+  const opexPrior = data.budgetTotalFy25;
+  const contingencyUsd = data.company.contingencyReserveUsd ?? (data.company.targets.contingencyPct * opex);
 
   return (
     <section className="hairline bg-ink-100/40">
       <div className="px-5 py-3 hairline-b flex items-center justify-between">
         <div>
-          <div className="text-[10px] uppercase tracking-[0.24em] text-paper-500">FY2026 Operating Budget</div>
+          <div className="text-[10px] uppercase tracking-[0.24em] text-paper-500">{fy} Operating Budget</div>
           <div className="font-display text-[20px] text-paper-50 mt-0.5 tracking-tight">
-            <GroundedNumber value={BUDGET_TOTAL_FY26} compact precision={1} size="lg" lineageId="budget_total" label="FY2026 Total OpEx" />
-            <span className="ml-2 text-[12px] font-sans text-paper-400 font-normal">across 60 line items · 11 categories</span>
+            <GroundedNumber value={opex} compact precision={1} size="lg" lineageId="budget_total" label={`${fy} Total OpEx`} />
+            <span className="ml-2 text-[12px] font-sans text-paper-400 font-normal">across {data.budgetLines.length} line items · {data.budgetCategories.length} categories</span>
           </div>
         </div>
         <div className="flex items-center gap-3">
           <Pill color="info">BASELINE</Pill>
-          <Pill color="stable">FY2026 LOCKED · 04 NOV</Pill>
+          <Pill color="stable">{fy} LOCKED</Pill>
         </div>
       </div>
 
@@ -2113,7 +2785,7 @@ function BudgetPanel() {
                     return (
                       <div className="hairline bg-ink-200 px-3 py-2 text-[11px]">
                         <div className="text-paper-50 font-mono">{d.name}</div>
-                        <div className="text-paper-300 font-mono">{fmtUSD(d.total, { compact: true })} · {fmtPct(d.total / BUDGET_TOTAL_FY26, 1)}</div>
+                        <div className="text-paper-300 font-mono">{fmtUSD(d.total, { compact: true })} · {fmtPct(opex > 0 ? d.total / opex : 0, 1)}</div>
                       </div>
                     );
                   }}
@@ -2123,13 +2795,15 @@ function BudgetPanel() {
             {/* Overlay covers the same 280px box → its center matches the pie center exactly */}
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
               <div className="text-center leading-tight">
-                <div className="text-[9px] uppercase tracking-[0.24em] text-paper-500">OpEx FY26</div>
+                <div className="text-[9px] uppercase tracking-[0.24em] text-paper-500">OpEx {fy}</div>
                 <div className="font-display text-[22px] text-paper-50 leading-none mt-1.5 whitespace-nowrap">
-                  {fmtUSD(BUDGET_TOTAL_FY26, { compact: true })}
+                  {fmtUSD(opex, { compact: true })}
                 </div>
-                <div className="text-[10px] text-paper-400 mt-1.5 font-mono whitespace-nowrap">
-                  +{fmtPct((BUDGET_TOTAL_FY26 - BUDGET_TOTAL_FY25) / BUDGET_TOTAL_FY25, 1)} vs FY25
-                </div>
+                {opexPrior > 0 && (
+                  <div className="text-[10px] text-paper-400 mt-1.5 font-mono whitespace-nowrap">
+                    +{fmtPct((opex - opexPrior) / opexPrior, 1)} vs FY prior
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -2148,7 +2822,7 @@ function BudgetPanel() {
                 <div className="size-2.5 flex-none" style={{ background: c.color }} />
                 <div className="text-[11.5px] text-paper-100 flex-1">{c.name}</div>
                 <div className="font-mono text-[11px] text-paper-200">{fmtUSD(c.total, { compact: true })}</div>
-                <div className="font-mono text-[10px] text-paper-500 w-10 text-right">{fmtPct(c.total / BUDGET_TOTAL_FY26, 1)}</div>
+                <div className="font-mono text-[10px] text-paper-500 w-10 text-right">{fmtPct(opex > 0 ? c.total / opex : 0, 1)}</div>
               </div>
             ))}
           </div>
@@ -2157,12 +2831,12 @@ function BudgetPanel() {
         {/* KPIs vertical stack */}
         <div className="col-span-3 bg-ink-100 p-5 space-y-3">
           <SmallKPI
-            label="Gross Margin (proj)" value={(COMPANY.revenue - BUDGET_TOTAL_FY26) / COMPANY.revenue}
-            target={COMPANY.targets.grossMargin} format="pct" lineageId="margin"
+            label="Gross Margin (proj)" value={data.company.revenue > 0 ? (data.company.revenue - opex) / data.company.revenue : 0}
+            target={data.company.targets.grossMargin} format="pct" lineageId="margin"
           />
-          <SmallKPI label="EBITDA Margin" value={0.139} target={COMPANY.targets.ebitdaMargin} format="pct" lineageId="ebitda" />
-          <SmallKPI label="Contingency" value={4_800_000 / BUDGET_TOTAL_FY26} target={0.04} format="pct" lineageId="contingency" />
-          <SmallKPI label="Hedge Coverage" value={0.70} target={COMPANY.targets.hedgeCoverage} format="pct" />
+          <SmallKPI label="EBITDA Margin" value={data.company.currentEbitdaMargin ?? 0.139} target={data.company.targets.ebitdaMargin} format="pct" lineageId="ebitda" />
+          <SmallKPI label="Contingency" value={opex > 0 ? contingencyUsd / opex : 0} target={data.company.targets.contingencyPct} format="pct" lineageId="contingency" />
+          <SmallKPI label="Hedge Coverage" value={data.company.targets.hedgeCoverage} target={data.company.targets.hedgeCoverage} format="pct" />
         </div>
       </div>
     </section>
@@ -2188,14 +2862,33 @@ function SmallKPI({ label, value, target, format = 'pct', lineageId }) {
 
 // ---------- Supplier Risk Heatmap ----------
 function SupplierHeatmap() {
+  const { suppliers, regions } = useWarRoom(s => ({ suppliers: s.data.suppliers, regions: s.data.regions }));
   const [hovered, setHovered] = useState(null);
   const [selected, setSelected] = useState(null);
 
+  // Group by whatever region codes are present in the dataset (NA/EU/AS/ME/...).
   const byRegion = useMemo(() => {
-    const groups = { NA: [], EU: [], AS: [], ME: [] };
-    SUPPLIERS.forEach(s => groups[s.region].push(s));
+    const groups = {};
+    for (const code of Object.keys(regions)) groups[code] = [];
+    for (const s of suppliers) {
+      if (!groups[s.region]) groups[s.region] = [];
+      groups[s.region].push(s);
+    }
     return groups;
-  }, []);
+  }, [suppliers, regions]);
+
+  // For very small datasets (uploads), the supplier tile grid shouldn't stretch
+  // to fixed 10 columns — choose a column count that keeps tiles ≥6px square.
+  const cellCols = useMemo(() => {
+    const maxInRegion = Math.max(...Object.values(byRegion).map(l => l.length), 1);
+    if (maxInRegion >= 60) return 10;
+    if (maxInRegion >= 24) return 8;
+    if (maxInRegion >= 12) return 6;
+    return Math.max(2, Math.ceil(Math.sqrt(maxInRegion)));
+  }, [byRegion]);
+
+  const regionCount = Object.keys(byRegion).length;
+  const gridCols = regionCount <= 1 ? 'grid-cols-1' : regionCount === 2 ? 'grid-cols-2' : regionCount === 3 ? 'grid-cols-3' : 'grid-cols-4';
 
   return (
     <section className="hairline bg-ink-100/40 relative">
@@ -2203,7 +2896,7 @@ function SupplierHeatmap() {
         <div>
           <div className="text-[10px] uppercase tracking-[0.24em] text-paper-500">Supplier Risk Heatmap</div>
           <div className="font-display text-[16px] text-paper-50 mt-0.5">
-            240 suppliers · composite risk score
+            {suppliers.length} suppliers · composite risk score
             <span className="ml-3 text-[12px] font-sans text-paper-400 font-normal">XGBoost / Isolation Forest ensemble · retrained weekly</span>
           </div>
         </div>
@@ -2218,14 +2911,14 @@ function SupplierHeatmap() {
         </div>
       </div>
 
-      <div className="grid grid-cols-4 gap-px bg-ink-300/40">
+      <div className={`grid ${gridCols} gap-px bg-ink-300/40`}>
         {Object.entries(byRegion).map(([r, list]) => (
           <div key={r} className="bg-ink-100 p-4 min-h-[200px]">
             <div className="flex items-baseline justify-between mb-2">
-              <div className="text-[10px] uppercase tracking-[0.22em] text-paper-400">{REGIONS[r].name}</div>
+              <div className="text-[10px] uppercase tracking-[0.22em] text-paper-400">{regions[r]?.name || r}</div>
               <div className="text-[10px] font-mono text-paper-500">{list.length}</div>
             </div>
-            <div className="grid grid-cols-10 gap-[2px]">
+            <div className="grid gap-[2px]" style={{ gridTemplateColumns: `repeat(${cellCols}, minmax(0, 1fr))` }}>
               {list.map(s => (
                 <button
                   key={s.id}
@@ -2239,7 +2932,7 @@ function SupplierHeatmap() {
             </div>
             <div className="mt-2 flex items-baseline gap-2 text-[10px] font-mono">
               <span className="text-paper-500">avg</span>
-              <span className="text-paper-200">{Math.round(list.reduce((a,x)=>a+x.riskScore,0)/list.length)}</span>
+              <span className="text-paper-200">{list.length ? Math.round(list.reduce((a,x)=>a+x.riskScore,0)/list.length) : 0}</span>
               <span className="text-paper-500 ml-auto">red</span>
               <span className="text-red-400">{list.filter(x=>x.riskScore>=65).length}</span>
             </div>
@@ -2349,13 +3042,14 @@ function ActivityFeed() {
  * ========================================================================== */
 
 function AlertBanner() {
-  const { activeEventId, acceptAlert, reset, savedPlays, secondaryEventId, multiEvent, mode } = useWarRoom(s => ({
+  const { activeEventId, acceptAlert, reset, savedPlays, secondaryEventId, multiEvent, mode, data } = useWarRoom(s => ({
     activeEventId: s.activeEventId, acceptAlert: s.acceptAlert, reset: s.reset,
     savedPlays: s.savedPlays, secondaryEventId: s.secondaryEventId, multiEvent: s.multiEvent, mode: s.mode,
+    data: s.data,
   }));
   const [aiBlurb, setAiBlurb] = useState(null);
-  const event = activeEventId ? EVENT_BY_ID[activeEventId] : null;
-  const ev2 = secondaryEventId ? EVENT_BY_ID[secondaryEventId] : null;
+  const event = activeEventId ? data.eventById[activeEventId] : null;
+  const ev2 = secondaryEventId ? data.eventById[secondaryEventId] : null;
   const [showGlow, setShowGlow] = useState(true);
 
   useEffect(() => {
@@ -2373,8 +3067,9 @@ function AlertBanner() {
       const baseLine = `${event.aiBlurb}` + (ev2 ? ` Joint exposure with ${ev2.label}: non-linear interaction effects raise total risk envelope.` : '');
       const { activeProvider, providerConfig } = useWarRoom.getState();
       if (!isAIConfigured(activeProvider, providerConfig)) { setAiBlurb(baseLine); return; }
+      const revM = data.company.revenue >= 1_000_000_000 ? `$${(data.company.revenue / 1_000_000_000).toFixed(1)}B` : `$${(data.company.revenue / 1_000_000).toFixed(0)}M`;
       const res = await callAI({
-        system: `You are a CFO crisis advisor at Meridian Drivetrain Systems (auto parts mfg, $195M revenue, 6 plants, ${SUPPLIERS.length} suppliers). Reply in TWO sentences max. NO numbers, no $-figures, no probabilities. Focus on operational implication and decision urgency.`,
+        system: `You are a CFO crisis advisor at ${data.company.name} (${data.company.industry || 'manufacturing'}, ${revM} revenue, ${data.company.plants.length} plants, ${data.suppliers.length} suppliers). Reply in TWO sentences max. NO numbers, no $-figures, no probabilities. Focus on operational implication and decision urgency.`,
         messages: [{ role: 'user', content: `New signal: ${event.label}. Severity ${event.severity}. Geography ${event.region}. Context: ${event.summary}. ${ev2 ? `Co-occurring: ${ev2.label}.` : ''} Write the two-sentence alert blurb shown on the war room screen.` }],
         temperature: 0.6,
         maxTokens: 140,
@@ -2384,7 +3079,7 @@ function AlertBanner() {
     }
     go();
     return () => { cancelled = true; };
-  }, [event, ev2]);
+  }, [event, ev2, data]);
 
   // Reactive provider label for the byline (without leaking any key material)
   const aiByline = useWarRoom(s => {
@@ -2506,7 +3201,7 @@ function CascadingGraphPanel() {
   const simulationRef = useRef(null);
   const {
     cascade, openLineage, multiEvent, secondaryEventId, activeEventId,
-    counterfactualDays, setCounterfactualDays, strategyApplied,
+    counterfactualDays, setCounterfactualDays, strategyApplied, data,
   } = useWarRoom();
   const [revealedLayer, setRevealedLayer] = useState(0);
   const [size, setSize] = useState({ w: 800, h: 600 });
@@ -2520,7 +3215,9 @@ function CascadingGraphPanel() {
   const renderCascade = useMemo(() => {
     if (!cascade) return null;
     if (!multiEvent || !secondaryEventId) return cascade;
-    const second = buildCascade(EVENT_BY_ID[secondaryEventId]);
+    const secondEv = data.eventById[secondaryEventId];
+    if (!secondEv) return cascade;
+    const second = buildCascade(secondEv, data);
     // Merge nodes by id (joint markers)
     const seen = new Map();
     cascade.nodes.forEach(n => seen.set(n.id, { ...n, joint: false }));
@@ -2533,7 +3230,7 @@ function CascadingGraphPanel() {
     });
     const allLinks = [...cascade.links, ...second.links];
     return { nodes: Array.from(seen.values()), links: allLinks };
-  }, [cascade, multiEvent, secondaryEventId]);
+  }, [cascade, multiEvent, secondaryEventId, data]);
 
   // Resize observer
   useEffect(() => {
@@ -2735,8 +3432,8 @@ function CascadingGraphPanel() {
         <div>
           <div className="text-[10px] uppercase tracking-[0.24em] text-paper-500">Cascading Impact Graph</div>
           <div className="font-display text-[16px] text-paper-50 mt-0.5">
-            {EVENT_BY_ID[activeEventId]?.label}
-            {multiEvent && secondaryEventId && <span className="text-critical-soft"> × {EVENT_BY_ID[secondaryEventId].label.split('(')[0].trim()}</span>}
+            {data.eventById[activeEventId]?.label}
+            {multiEvent && secondaryEventId && <span className="text-critical-soft"> × {data.eventById[secondaryEventId]?.label.split('(')[0].trim()}</span>}
           </div>
         </div>
         <div className="flex items-center gap-3">
@@ -2800,8 +3497,8 @@ function CascadingGraphPanel() {
 
 // ---------- Counterfactual replay slider ----------
 function CounterfactualReplay() {
-  const { counterfactualDays, setCounterfactualDays, activeEventId } = useWarRoom();
-  const event = activeEventId ? EVENT_BY_ID[activeEventId] : null;
+  const { counterfactualDays, setCounterfactualDays, activeEventId, data } = useWarRoom();
+  const event = activeEventId ? data.eventById[activeEventId] : null;
   if (!event) return null;
   // Savings forgone scales non-linearly with delay
   const forgoneRate = (counterfactualDays / 21) * 0.42; // up to 42% of P50 impact
@@ -2853,23 +3550,27 @@ function CounterfactualReplay() {
 // ---------- Baseline Impact panel — shown BEFORE any strategy is applied ----------
 // The user needs to see the cost of doing nothing immediately on entering Response State.
 function BaselineImpactPanel() {
-  const { activeEventId, multiEvent, secondaryEventId } = useWarRoom();
-  const event = activeEventId ? EVENT_BY_ID[activeEventId] : null;
+  const { activeEventId, multiEvent, secondaryEventId, data } = useWarRoom();
+  const event = activeEventId ? data.eventById[activeEventId] : null;
   if (!event) return null;
 
   // Joint impact when multi-event stress mode is on (~18% non-linear interaction penalty)
-  const ev2 = multiEvent && secondaryEventId ? EVENT_BY_ID[secondaryEventId] : null;
+  const ev2 = multiEvent && secondaryEventId ? data.eventById[secondaryEventId] : null;
   const ev2Mult = 1.18;
   const p50 = event.impactRange.mode + (ev2 ? ev2.impactRange.mode * ev2Mult : 0);
   const p10 = event.impactRange.min  + (ev2 ? ev2.impactRange.min  * ev2Mult : 0);
   const p90 = event.impactRange.max  + (ev2 ? ev2.impactRange.max  * ev2Mult : 0);
   const spread = (p90 - p10) / 2;
 
-  // Top-affected budget lines for the per-line bars (4.5% impact rate against fy26 baseline)
+  // Top-affected budget lines for the per-line bars. For uploaded data the
+  // impact rate is the per-event Impact_Weight × 6%; for Meridian default it's a
+  // flat 4.5% (matching the original behavior).
   const affected = event.affectedLineIds.slice(0, 7).map(id => {
-    const l = BUDGET_LINES.find(x => x.id === id);
+    const l = data.budgetLines.find(x => x.id === id);
     if (!l) return null;
-    return { id: l.id, name: l.name, impact: l.fy26 * 0.045 };
+    const weight = event.impactWeights?.[id];
+    const impactRate = weight != null ? Math.min(0.15, weight * 0.06) : 0.045;
+    return { id: l.id, name: l.name, impact: l.fy26 * impactRate };
   }).filter(Boolean);
   const maxBar = Math.max(...affected.map(l => l.impact), 1);
 
@@ -2951,14 +3652,15 @@ function BaselineImpactPanel() {
 
 // ---------- Baseline vs Mitigated comparison panel (lives BELOW the graph, Change 4) ----------
 function BaselineVsMitigated() {
-  const { activeEventId, multiEvent, appliedStrategy } = useWarRoom();
-  const event = activeEventId ? EVENT_BY_ID[activeEventId] : null;
+  const { activeEventId, secondaryEventId, multiEvent, appliedStrategy, data } = useWarRoom();
+  const event = activeEventId ? data.eventById[activeEventId] : null;
+  const ev2 = multiEvent && secondaryEventId ? data.eventById[secondaryEventId] : null;
   const [slide, setSlide] = useState(50);
   if (!event || !appliedStrategy) return null;
 
   const appliedClauses = appliedStrategy.clauses;
-  const result = solveStrategy(event, appliedClauses, multiEvent);
-  const baselineImpact = event.impactRange.mode + (multiEvent ? (EVENT_BY_ID.CHINA_TARIFF?.impactRange.mode || 0) * 1.18 : 0);
+  const result = solveStrategy(event, appliedClauses, data.clauses, multiEvent);
+  const baselineImpact = event.impactRange.mode + (ev2 ? ev2.impactRange.mode * 1.18 : 0);
   const mitigatedImpact = Math.max(0, baselineImpact - result.savingsMode);
   const t = slide / 100;
   const currentImpact = baselineImpact * (1 - t) + mitigatedImpact * t;
@@ -2966,9 +3668,11 @@ function BaselineVsMitigated() {
 
   // Affected budget lines visualization
   const affectedLines = event.affectedLineIds.slice(0, 7).map(id => {
-    const l = BUDGET_LINES.find(x => x.id === id);
+    const l = data.budgetLines.find(x => x.id === id);
     if (!l) return null;
-    const lineBaseline  = l.fy26 * 0.045;
+    const weight = event.impactWeights?.[id];
+    const impactRate = weight != null ? Math.min(0.15, weight * 0.06) : 0.045;
+    const lineBaseline  = l.fy26 * impactRate;
     const lineMitigated = lineBaseline * (mitigatedImpact / Math.max(1, baselineImpact));
     const lineCurrent   = lineBaseline * (1 - t) + lineMitigated * t;
     return { id: l.id, name: l.name, lineBaseline, lineMitigated, lineCurrent };
@@ -3069,7 +3773,8 @@ function consensusOf(votes) {
 
 // ---------- Draggable clause pill (@dnd-kit) ----------
 function DraggableClausePill({ clauseId, sourceId, inWorkspace, dimmed }) {
-  const c = CLAUSES[clauseId];
+  const clauses = useWarRoom(s => s.data.clauses);
+  const c = clauses[clauseId];
   const dragId = `clause:${clauseId}:${sourceId}`;
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: dragId,
@@ -3097,14 +3802,18 @@ function DraggableClausePill({ clauseId, sourceId, inWorkspace, dimmed }) {
 
 // ---------- Strategy card (one per proposed mitigation) ----------
 function StrategyCard({ strategy, event, multiEvent }) {
-  const { strategyVotes, setStrategyVote, applyStrategyById, selectedStrategyId, setStrategy, selectedClauses, applyingStrategy } = useWarRoom();
-  const sResult = solveStrategy(event, strategy.clauses, multiEvent);
+  const { strategyVotes, setStrategyVote, applyStrategyById, selectedStrategyId, setStrategy, selectedClauses, applyingStrategy, clauses } = useWarRoom(s => ({
+    strategyVotes: s.strategyVotes, setStrategyVote: s.setStrategyVote, applyStrategyById: s.applyStrategyById,
+    selectedStrategyId: s.selectedStrategyId, setStrategy: s.setStrategy, selectedClauses: s.selectedClauses,
+    applyingStrategy: s.applyingStrategy, clauses: s.data.clauses,
+  }));
+  const sResult = solveStrategy(event, strategy.clauses, clauses, multiEvent);
   const isSelected = selectedStrategyId === strategy.id;
   const votes = strategyVotes[strategy.id];
   const cons = consensusOf(votes);
-  const compUSMCA = strategy.clauses.every(c => CLAUSES[c]?.compliance.usmca);
-  const compOFAC  = strategy.clauses.every(c => CLAUSES[c]?.compliance.ofac);
-  const compEAR   = strategy.clauses.every(c => CLAUSES[c]?.compliance.ear);
+  const compUSMCA = strategy.clauses.every(c => clauses[c]?.compliance.usmca);
+  const compOFAC  = strategy.clauses.every(c => clauses[c]?.compliance.ofac);
+  const compEAR   = strategy.clauses.every(c => clauses[c]?.compliance.ear);
   const rejected  = cons.cfoRejected;
 
   return (
@@ -3198,13 +3907,17 @@ function StrategyCard({ strategy, event, multiEvent }) {
 function CustomWorkspace({ event, multiEvent }) {
   const {
     selectedClauses, toggleClause, applyCustomStrategy,
-    applyingStrategy, strategyVotes, setStrategyVote,
-  } = useWarRoom();
+    applyingStrategy, strategyVotes, setStrategyVote, clauses,
+  } = useWarRoom(s => ({
+    selectedClauses: s.selectedClauses, toggleClause: s.toggleClause, applyCustomStrategy: s.applyCustomStrategy,
+    applyingStrategy: s.applyingStrategy, strategyVotes: s.strategyVotes, setStrategyVote: s.setStrategyVote,
+    clauses: s.data.clauses,
+  }));
   const { isOver, setNodeRef } = useDroppable({ id: 'custom-workspace' });
   const [solverRunning, setSolverRunning] = useState(false);
   const [montecarlo, setMontecarlo] = useState(null);
   const [mcRunning, setMcRunning] = useState(false);
-  const result = solveStrategy(event, selectedClauses, multiEvent);
+  const result = solveStrategy(event, selectedClauses, clauses, multiEvent);
   const votes = strategyVotes['CUSTOM'];
   const cons = consensusOf(votes);
 
@@ -3219,9 +3932,11 @@ function CustomWorkspace({ event, multiEvent }) {
     setMcRunning(true);
     const handle = setTimeout(() => {
       const items = selectedClauses.map(id => {
-        const c = CLAUSES[id];
+        const c = clauses[id];
+        if (!c) return null;
         return { min: c.savingsMin, mode: c.savingsMode, max: c.savingsMax };
-      });
+      }).filter(Boolean);
+      if (items.length === 0) { setMcRunning(false); return; }
       const interaction = items.length >= 3 ? 0.92 : 1;
       const sorted = runMonteCarlo(items.map(i => ({ min: i.min * interaction, mode: i.mode * interaction, max: i.max * interaction })), 5000);
       const [p10, p50, p90] = percentiles(sorted);
@@ -3281,7 +3996,7 @@ function CustomWorkspace({ event, multiEvent }) {
           <div className="flex flex-wrap gap-1.5">
             {selectedClauses.map(c => (
               <div key={c} className="flex items-center gap-1 bg-amber/15 border border-amber/40 px-1.5 py-[3px] hairline">
-                <span className="text-[9.5px] uppercase tracking-[0.14em] font-mono text-amber-300">{CLAUSES[c]?.name}</span>
+                <span className="text-[9.5px] uppercase tracking-[0.14em] font-mono text-amber-300">{clauses[c]?.name}</span>
                 <button onClick={() => toggleClause(c)} className="text-amber-400 hover:text-amber-200 leading-none">
                   <X size={10} />
                 </button>
@@ -3381,16 +4096,16 @@ function CustomWorkspace({ event, multiEvent }) {
 function MitigationWorkbench() {
   const {
     activeEventId, multiEvent, proposalSet, reproposing, rejectAll, switchProposalSet,
-    applyingStrategy, addClauseToCustom, strategyVotes,
+    applyingStrategy, addClauseToCustom, strategyVotes, data,
   } = useWarRoom();
-  const event = activeEventId ? EVENT_BY_ID[activeEventId] : null;
+  const event = activeEventId ? data.eventById[activeEventId] : null;
   const [draggingClauseId, setDraggingClauseId] = useState(null);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } })
   );
 
-  const visibleStrategies = proposalSet === 'primary' ? STRATEGIES.slice(0, 3) : ALTERNATIVE_STRATEGIES;
+  const visibleStrategies = proposalSet === 'primary' ? data.strategies.slice(0, 3) : data.alternativeStrategies;
 
   // Auto-trigger re-propose when all visible cards have CFO=Rejected
   useEffect(() => {
@@ -3420,7 +4135,7 @@ function MitigationWorkbench() {
   }
   function handleDragCancel() { setDraggingClauseId(null); }
 
-  const draggingClause = draggingClauseId ? CLAUSES[draggingClauseId] : null;
+  const draggingClause = draggingClauseId ? data.clauses[draggingClauseId] : null;
 
   return (
     <DndContext sensors={sensors} onDragStart={handleDragStart} onDragEnd={handleDragEnd} onDragCancel={handleDragCancel} collisionDetection={closestCenter}>
@@ -3631,8 +4346,17 @@ function DemoControls() {
     demoControlsOpen, setDemoControlsOpen, fireAlert, reset, mode,
     multiEvent, toggleMultiEvent, skipBoot, setSkipBoot,
     showConnectionLines, setShowConnectionLines, activeEventId,
-    theme, setTheme,
-  } = useWarRoom();
+    theme, setTheme, events,
+  } = useWarRoom(s => ({
+    demoControlsOpen: s.demoControlsOpen, setDemoControlsOpen: s.setDemoControlsOpen,
+    fireAlert: s.fireAlert, reset: s.reset, mode: s.mode,
+    multiEvent: s.multiEvent, toggleMultiEvent: s.toggleMultiEvent,
+    skipBoot: s.skipBoot, setSkipBoot: s.setSkipBoot,
+    showConnectionLines: s.showConnectionLines, setShowConnectionLines: s.setShowConnectionLines,
+    activeEventId: s.activeEventId,
+    theme: s.theme, setTheme: s.setTheme,
+    events: s.data.events,
+  }));
 
   // Cmd+Shift+D toggles
   useEffect(() => {
@@ -3646,7 +4370,13 @@ function DemoControls() {
     return () => window.removeEventListener('keydown', onKey);
   }, [setDemoControlsOpen]);
 
-  const [selectedEvent, setSelectedEvent] = useState('HORMUZ');
+  const [selectedEvent, setSelectedEvent] = useState(events[0]?.id || '');
+  // Keep selected event valid when the dataset changes (e.g. after upload)
+  useEffect(() => {
+    if (!events.find(e => e.id === selectedEvent)) {
+      setSelectedEvent(events[0]?.id || '');
+    }
+  }, [events, selectedEvent]);
 
   if (!demoControlsOpen) return null;
   return (
@@ -3687,7 +4417,7 @@ function DemoControls() {
             onChange={(e) => setSelectedEvent(e.target.value)}
             className="w-full hairline bg-ink-200 text-paper-100 px-3 py-2 text-[12px] font-mono"
           >
-            {EVENTS.map(e => <option key={e.id} value={e.id}>{e.label}</option>)}
+            {events.map(e => <option key={e.id} value={e.id}>{e.label}</option>)}
           </select>
           <div className="flex gap-2 mt-2">
             <button
@@ -3811,8 +4541,7 @@ function AdvisorInput({ draft, setDraft, send }) {
 }
 
 function AIAdvisorFAB() {
-  const { aiAdvisorOpen, setAiAdvisorOpen, activeEventId, selectedClauses, multiEvent, secondaryEventId } = useWarRoom();
-  const event = activeEventId ? EVENT_BY_ID[activeEventId] : null;
+  const { aiAdvisorOpen, setAiAdvisorOpen } = useWarRoom();
 
   return (
     <>
@@ -3830,13 +4559,13 @@ function AIAdvisorFAB() {
 }
 
 function AIAdvisorPanel() {
-  const { setAiAdvisorOpen, activeEventId, multiEvent, selectedClauses, secondaryEventId } = useWarRoom();
-  const event = activeEventId ? EVENT_BY_ID[activeEventId] : null;
-  const ev2 = secondaryEventId ? EVENT_BY_ID[secondaryEventId] : null;
+  const { setAiAdvisorOpen, activeEventId, multiEvent, selectedClauses, secondaryEventId, data } = useWarRoom();
+  const event = activeEventId ? data.eventById[activeEventId] : null;
+  const ev2 = secondaryEventId ? data.eventById[secondaryEventId] : null;
   const [messages, setMessages] = useState(() => [
     { role: 'assistant', text: event
-      ? `I'm tracking ${event.label} (${event.severity}). The cascade flows through ~22 suppliers, 8 budget lines, and 4 P&L outcomes. Ask me about ranking, options, or comparable past events.`
-      : `Steady state — I have FY2026 baseline loaded, 240 suppliers indexed, 60 budget lines mapped. Ask me anything about the portfolio.`
+      ? `I'm tracking ${event.label} (${event.severity}). The cascade flows through ${data.suppliers.filter(s => s.eventExposed).length || 'multiple'} suppliers, ${event.affectedLineIds.length} budget lines, and 4 P&L outcomes. Ask me about ranking, options, or comparable past events.`
+      : `Steady state — I have ${data.company.fy} baseline loaded, ${data.suppliers.length} suppliers indexed, ${data.budgetLines.length} budget lines mapped. Ask me anything about the portfolio.`
     },
   ]);
   const [draft, setDraft] = useState('');
@@ -3861,14 +4590,15 @@ function AIAdvisorPanel() {
     setDraft('');
     setPending(true);
 
-    const sys = `You are the CFO War Room advisor for Meridian Drivetrain Systems (auto parts mfg, $195M revenue, 6 NA plants).
+    const revM = data.company.revenue >= 1_000_000_000 ? `$${(data.company.revenue / 1_000_000_000).toFixed(1)}B` : `$${(data.company.revenue / 1_000_000).toFixed(0)}M`;
+    const sys = `You are the CFO War Room advisor for ${data.company.name} (${data.company.industry || 'manufacturing'}, ${revM} revenue, ${data.company.plants.length} plants).
 Active event: ${event ? event.label + ' (' + event.severity + ')' : 'none'}.
 ${ev2 ? 'Co-occurring: ' + ev2.label + '.' : ''}
-Selected clauses: ${selectedClauses.join(', ') || 'none'}.
+Selected clauses: ${selectedClauses.map(c => data.clauses[c]?.name || c).join(', ') || 'none'}.
 
 Rules:
 - Do NOT invent $-figures, probabilities, percentages, or confidence intervals.
-- Reference where a value would come from (e.g., "the Datasphere event_impact view shows ...") rather than naming the value.
+- Reference where a value would come from (e.g., "the event_impact view shows ...") rather than naming the value.
 - Be concise: 3-5 sentences max.
 - Operational, decision-focused tone.`;
 
@@ -3957,13 +4687,13 @@ Rules:
  * ========================================================================== */
 
 function BoardPackModal() {
-  const { boardPackOpen, setBoardPackOpen, activeEventId, selectedClauses, multiEvent, secondaryEventId, timeElapsedSec, strategyVotes, appliedStrategy } = useWarRoom();
+  const { boardPackOpen, setBoardPackOpen, activeEventId, selectedClauses, multiEvent, secondaryEventId, timeElapsedSec, strategyVotes, appliedStrategy, data } = useWarRoom();
   const [pending, setPending] = useState(false);
   const [summary, setSummary] = useState(null);
   const [done, setDone] = useState(false);
-  const event = activeEventId ? EVENT_BY_ID[activeEventId] : null;
-  const ev2 = secondaryEventId ? EVENT_BY_ID[secondaryEventId] : null;
-  const result = event ? solveStrategy(event, selectedClauses, multiEvent) : null;
+  const event = activeEventId ? data.eventById[activeEventId] : null;
+  const ev2 = secondaryEventId ? data.eventById[secondaryEventId] : null;
+  const result = event ? solveStrategy(event, selectedClauses, data.clauses, multiEvent) : null;
   // Votes to embed in deck: the applied strategy's votes (or 'CUSTOM' workspace)
   const relevantVotes = appliedStrategy ? (strategyVotes[appliedStrategy.id] || {}) : (strategyVotes['CUSTOM'] || {});
 
@@ -3972,12 +4702,13 @@ function BoardPackModal() {
     let cancelled = false;
     async function gen() {
       if (!event) return;
-      const fallback = `${event.label} has emerged as a ${event.severity.toLowerCase()} disruption with material exposure to ${event.primaryDriver}. Time-to-decision is currently ${fmtDuration(timeElapsedSec)} versus an industry benchmark of six weeks. Recommended mitigation composition: ${selectedClauses.map(c => CLAUSES[c]?.name).join(', ') || 'pending selection'}.`;
+      const clauseNames = selectedClauses.map(c => data.clauses[c]?.name).filter(Boolean).join(', ') || 'pending selection';
+      const fallback = `${event.label} has emerged as a ${event.severity.toLowerCase()} disruption with material exposure to ${event.primaryDriver}. Time-to-decision is currently ${fmtDuration(timeElapsedSec)} versus an industry benchmark of six weeks. Recommended mitigation composition: ${clauseNames}.`;
       const { activeProvider, providerConfig } = useWarRoom.getState();
       if (!isAIConfigured(activeProvider, providerConfig)) { if (!cancelled) setSummary(fallback); return; }
       const res = await callAI({
         system: 'You are a CFO board-pack writer. Write a 3-sentence Situation summary. NO numbers, NO percentages — operational language only.',
-        messages: [{ role: 'user', content: `Event: ${event.label}. Severity: ${event.severity}. Primary driver: ${event.primaryDriver}. Time elapsed: ${fmtDuration(timeElapsedSec)}.${ev2 ? ' Co-occurring: ' + ev2.label + '.' : ''} Active clauses: ${selectedClauses.map(c => CLAUSES[c]?.name).join(', ') || 'none'}.` }],
+        messages: [{ role: 'user', content: `Event: ${event.label}. Severity: ${event.severity}. Primary driver: ${event.primaryDriver}. Time elapsed: ${fmtDuration(timeElapsedSec)}.${ev2 ? ' Co-occurring: ' + ev2.label + '.' : ''} Active clauses: ${clauseNames}.` }],
         temperature: 0.4,
         maxTokens: 220,
       });
@@ -3986,13 +4717,13 @@ function BoardPackModal() {
     }
     gen();
     return () => { cancelled = true; };
-  }, [boardPackOpen, event, ev2, selectedClauses, timeElapsedSec, multiEvent]);
+  }, [boardPackOpen, event, ev2, selectedClauses, timeElapsedSec, multiEvent, data]);
 
   async function generatePack() {
     if (!event || !result) return;
     setPending(true);
     try {
-      await buildPptx({ event, ev2, multiEvent, result, selectedClauses, summary, timeElapsedSec, votes: relevantVotes });
+      await buildPptx({ event, ev2, multiEvent, result, selectedClauses, summary, timeElapsedSec, votes: relevantVotes, data });
       setDone(true);
       useWarRoom.getState().pushAudit({ actor: 'System', action: 'Generated', object: 'Board Pack', detail: '4 slides · pptx exported' });
     } finally {
@@ -4015,9 +4746,9 @@ function BoardPackModal() {
           </div>
 
           <div className="p-5 space-y-4">
-            <SlidePreviewRow ordinal={1} title="Situation" hint={summary ? (summary.length > 130 ? summary.slice(0, 127) + '…' : summary) : <span className="flex items-center gap-2 text-paper-500"><Loader2 size={11} className="animate-spin" /> generating with ChatPwC...</span>} />
-            <SlidePreviewRow ordinal={2} title="Options · Top 3 Strategies" hint={`${STRATEGIES.slice(0,3).map(s => s.name).join(' · ')}`} />
-            <SlidePreviewRow ordinal={3} title="Recommendation" hint={selectedClauses.map(c => CLAUSES[c]?.name).join(' + ') || 'No clauses selected'} />
+            <SlidePreviewRow ordinal={1} title="Situation" hint={summary ? (summary.length > 130 ? summary.slice(0, 127) + '…' : summary) : <span className="flex items-center gap-2 text-paper-500"><Loader2 size={11} className="animate-spin" /> generating summary...</span>} />
+            <SlidePreviewRow ordinal={2} title="Options · Top 3 Strategies" hint={`${data.strategies.slice(0,3).map(s => s.name).join(' · ')}`} />
+            <SlidePreviewRow ordinal={3} title="Recommendation" hint={selectedClauses.map(c => data.clauses[c]?.name).filter(Boolean).join(' + ') || 'No clauses selected'} />
             <SlidePreviewRow ordinal={4} title="Financial Impact" hint={`Baseline vs Mitigated · P50 savings ${fmtUSD(result?.savingsMode || 0, { compact: true })}`} />
 
             <div className="hairline-t pt-3 flex items-center gap-3">
@@ -4037,7 +4768,7 @@ function BoardPackModal() {
             </div>
 
             <div className="text-[9px] uppercase tracking-[0.18em] text-paper-500 font-mono">
-              pptxgenjs · 4 slides · 16:9 · grounded values traced to Datasphere
+              pptxgenjs · 4 slides · 16:9 · grounded values traced to {data.source.type === 'upload' ? 'uploaded workbook' : 'Datasphere'}
             </div>
           </div>
         </div>
@@ -4059,11 +4790,20 @@ function SlidePreviewRow({ ordinal, title, hint }) {
   );
 }
 
-async function buildPptx({ event, ev2, multiEvent, result, selectedClauses, summary, timeElapsedSec, votes }) {
+async function buildPptx({ event, ev2, multiEvent, result, selectedClauses, summary, timeElapsedSec, votes, data }) {
+  const company = data.company;
+  const STRATEGIES_LOCAL = data.strategies;
+  const CLAUSES_LOCAL = data.clauses;
+  const BUDGET_TOTAL_FY26_LOCAL = data.budgetTotalFy26;
+
+  // ASCII filename slug for the .pptx (avoid Unicode/spaces tripping up downloads)
+  const slug = String(company.name).replace(/[^A-Za-z0-9]+/g, '_').slice(0, 32).replace(/^_+|_+$/g, '') || 'Company';
+  const fyStr = company.fy;
+
   const pptx = new PptxGenJS();
   pptx.layout = 'LAYOUT_WIDE'; // 13.33 x 7.5 inches
-  pptx.author = 'Meridian Drivetrain Systems · Black Swan War Room';
-  pptx.company = 'Meridian Drivetrain Systems, Inc.';
+  pptx.author = `${company.name} · Black Swan War Room`;
+  pptx.company = company.name;
   pptx.title = `Crisis Response · ${event.label}`;
 
   // ---- Theme ----
@@ -4090,12 +4830,14 @@ async function buildPptx({ event, ev2, multiEvent, result, selectedClauses, summ
           options: { x: 0.5, y: 0.13, w: 4.0, h: 0.16, fontFace: 'JetBrains Mono', fontSize: 8, color: C.paper2, charSpacing: 4 },
       } },
       { text: {
-          text: 'MERIDIAN DRIVETRAIN SYSTEMS · FY2026',
+          text: `${company.name.toUpperCase()} · ${fyStr}`,
           options: { x: 8.83, y: 0.13, w: 4.5, h: 0.16, fontFace: 'JetBrains Mono', fontSize: 8, color: C.paper3, charSpacing: 4, align: 'right' },
       } },
       // Footer
       { text: {
-          text: 'GROUNDED IN DATASPHERE · MODEL CARDS AVAILABLE · GENERATED BY OR-TOOLS LP + BAYESIAN ENSEMBLE',
+          text: data.source.type === 'upload'
+            ? `GROUNDED IN UPLOADED WORKBOOK · MODEL CARDS AVAILABLE · GENERATED BY OR-TOOLS LP + BAYESIAN ENSEMBLE`
+            : 'GROUNDED IN DATASPHERE · MODEL CARDS AVAILABLE · GENERATED BY OR-TOOLS LP + BAYESIAN ENSEMBLE',
           options: { x: 0.5, y: 7.18, w: 12.33, h: 0.16, fontFace: 'JetBrains Mono', fontSize: 7, color: C.paper3, charSpacing: 3 },
       } },
     ],
@@ -4147,14 +4889,14 @@ async function buildPptx({ event, ev2, multiEvent, result, selectedClauses, summ
       { x: 0.72, y: 1.0, w: 12, h: 0.5, fontFace: 'Georgia', fontSize: 24, color: C.paper });
 
     // 3 strategy cards side by side
-    const top3 = STRATEGIES.slice(0, 3);
+    const top3 = STRATEGIES_LOCAL.slice(0, 3);
     top3.forEach((strat, i) => {
-      const sRes = solveStrategy(event, strat.clauses, multiEvent);
+      const sRes = solveStrategy(event, strat.clauses, CLAUSES_LOCAL, multiEvent);
       const cx = 0.72 + i * 4.15;
       const cw = 3.95;
       s.addShape('rect', { x: cx, y: 1.85, w: cw, h: 5.1, fill: { color: C.ink2 }, line: { color: C.ink3, width: 0.5 } });
       // index
-      s.addText('MIT-00' + (i + 1),
+      s.addText(strat.id,
         { x: cx + 0.15, y: 2.0, w: 1.2, h: 0.2, fontFace: 'JetBrains Mono', fontSize: 8, color: C.paper3, charSpacing: 4 });
       // name
       s.addText(strat.name, { x: cx + 0.15, y: 2.25, w: cw - 0.3, h: 0.8, fontFace: 'Georgia', fontSize: 15, color: C.paper, valign: 'top' });
@@ -4189,7 +4931,7 @@ async function buildPptx({ event, ev2, multiEvent, result, selectedClauses, summ
     s.addShape('rect', { x: 0.5, y: 0.7, w: 0.08, h: 0.6, fill: { color: C.stable }, line: { type: 'none' } });
     s.addText('RECOMMENDATION',
       { x: 0.72, y: 0.7, w: 8, h: 0.3, fontFace: 'JetBrains Mono', fontSize: 10, color: C.stable, charSpacing: 6, bold: true });
-    const recName = selectedClauses.map(c => CLAUSES[c]?.name).join(' + ') || 'No clauses selected';
+    const recName = selectedClauses.map(c => CLAUSES_LOCAL[c]?.name).filter(Boolean).join(' + ') || 'No clauses selected';
     s.addText(recName, { x: 0.72, y: 1.0, w: 12, h: 0.9, fontFace: 'Georgia', fontSize: 22, color: C.paper, valign: 'top' });
 
     // Rationale block
@@ -4197,9 +4939,10 @@ async function buildPptx({ event, ev2, multiEvent, result, selectedClauses, summ
     s.addText('RATIONALE', { x: 0.9, y: 2.2, w: 4, h: 0.2, fontFace: 'JetBrains Mono', fontSize: 8, color: C.paper3, charSpacing: 4 });
 
     const clauseLines = selectedClauses.map((cId, i) => {
-      const c = CLAUSES[cId];
+      const c = CLAUSES_LOCAL[cId];
+      if (!c) return null;
       return { text: `${i + 1}.  ${c.name} — projected savings ${fmtUSD(c.savingsMode, { compact: true })}`, options: { fontFace: 'Geist', fontSize: 13, color: C.paper, bullet: false, breakLine: true, paraSpaceAfter: 8 } };
-    });
+    }).filter(Boolean);
     if (clauseLines.length === 0) clauseLines.push({ text: 'No clauses currently selected. Compose a strategy before exporting.', options: { fontFace: 'Geist', fontSize: 13, color: C.paper2 } });
     s.addText(clauseLines, { x: 0.9, y: 2.5, w: 7.1, h: 3.8, valign: 'top' });
 
@@ -4232,7 +4975,7 @@ async function buildPptx({ event, ev2, multiEvent, result, selectedClauses, summ
     s.addText('Baseline vs Mitigated · Monte Carlo Bands',
       { x: 0.72, y: 1.0, w: 12, h: 0.5, fontFace: 'Georgia', fontSize: 22, color: C.paper });
 
-    const baselineImpact = event.impactRange.mode + (multiEvent ? (EVENT_BY_ID.CHINA_TARIFF?.impactRange.mode || 0) * 1.18 : 0);
+    const baselineImpact = event.impactRange.mode + (ev2 ? ev2.impactRange.mode * 1.18 : 0);
     const mitigatedImpact = Math.max(0, baselineImpact - result.savingsMode);
 
     // Bar chart for Baseline vs Mitigated (recharts not available in pptx; use rects)
@@ -4301,13 +5044,15 @@ async function buildPptx({ event, ev2, multiEvent, result, selectedClauses, summ
     });
 
     // KPI deltas
-    s.addText('KPI DELTAS · FY2026', { x: rL + 0.15, y: 4.0, w: 4, h: 0.2, fontFace: 'JetBrains Mono', fontSize: 8, color: C.paper3, charSpacing: 4 });
-    const baselineMargin = (COMPANY.revenue - BUDGET_TOTAL_FY26) / COMPANY.revenue;
-    const mitigatedMargin = (COMPANY.revenue - BUDGET_TOTAL_FY26 - mitigatedImpact) / COMPANY.revenue;
+    s.addText(`KPI DELTAS · ${fyStr}`, { x: rL + 0.15, y: 4.0, w: 4, h: 0.2, fontFace: 'JetBrains Mono', fontSize: 8, color: C.paper3, charSpacing: 4 });
+    const rev = company.revenue || 1;
+    const baselineMargin = (rev - BUDGET_TOTAL_FY26_LOCAL) / rev;
+    const mitigatedMargin = (rev - BUDGET_TOTAL_FY26_LOCAL - mitigatedImpact) / rev;
+    const ebitdaCur = company.currentEbitdaMargin ?? 0.139;
     const kpis = [
       ['Gross Margin', fmtPct(baselineMargin, 1) + ' → ' + fmtPct(mitigatedMargin, 1), C.amber],
-      ['EBITDA Margin', '13.9% → ' + fmtPct(0.139 - mitigatedImpact / COMPANY.revenue, 1), C.amber],
-      ['Hedge Coverage', '70% → 90%', C.stable],
+      ['EBITDA Margin', fmtPct(ebitdaCur, 1) + ' → ' + fmtPct(ebitdaCur - mitigatedImpact / rev, 1), C.amber],
+      ['Hedge Coverage', `${Math.round(company.targets.hedgeCoverage * 100)}% → 90%`, C.stable],
       ['Risk Score', 'Δ -8 pts',                  C.stable],
     ];
     kpis.forEach(([lbl, val, color], i) => {
@@ -4321,7 +5066,7 @@ async function buildPptx({ event, ev2, multiEvent, result, selectedClauses, summ
   }
 
   // ---- Write file ----
-  await pptx.writeFile({ fileName: `MDS_BoardPack_${event.id}_${new Date().toISOString().slice(0,10)}.pptx` });
+  await pptx.writeFile({ fileName: `${slug}_BoardPack_${event.id}_${new Date().toISOString().slice(0,10)}.pptx` });
 }
 
 /* ============================================================================
@@ -4864,6 +5609,428 @@ function MainCanvas() {
  * SECTION 18: APP ROOT
  * ========================================================================== */
 
+/* ============================================================================
+ * SECTION 19: LANDING PAGE
+ *
+ * Entry surface shown before the boot sequence. Two paths in, both lead to
+ * the same war room:
+ *   A. Run Demo Mode — uses the built-in Meridian dataset (default).
+ *   B. Upload Excel — validates the workbook, loads its data into zustand.
+ *
+ * Respects the active theme; never persists; theme toggle lives on the page.
+ * ========================================================================== */
+
+function LandingPage() {
+  const { theme, setTheme, loadDataset } = useWarRoom();
+  return (
+    <div className="h-screen w-screen overflow-y-auto" style={{ background: 'var(--color-bg-canvas)', color: 'var(--color-text-primary)' }}>
+      {/* Subtle ambient glow (only renders in War Room — neutralized by SAC vars) */}
+      <div
+        className="absolute inset-0 pointer-events-none"
+        style={{ background: 'radial-gradient(ellipse at top, color-mix(in srgb, var(--color-primary) 8%, transparent), transparent 60%)' }}
+        aria-hidden="true"
+      />
+      <div className="absolute inset-0 hatch opacity-20 pointer-events-none" aria-hidden="true" />
+
+      {/* Top bar */}
+      <header className="relative z-10 px-8 py-5 hairline-b flex items-center justify-between" style={{ background: 'color-mix(in srgb, var(--color-bg-surface) 80%, transparent)', backdropFilter: 'blur(8px)' }}>
+        <div className="flex items-center gap-3">
+          <Logo size={28} />
+          <div className="leading-none">
+            <div className="font-display text-[18px] tracking-tight" style={{ color: 'var(--color-text-primary)' }}>Black Swan</div>
+            <div className="text-[9px] uppercase tracking-[0.28em] mt-1 font-mono" style={{ color: 'var(--color-text-tertiary)' }}>War Room · Prototype</div>
+          </div>
+        </div>
+        <ThemeToggle theme={theme} setTheme={setTheme} />
+      </header>
+
+      <main className="relative z-10 max-w-[1180px] mx-auto px-8 py-16">
+        {/* HERO */}
+        <section className="text-center max-w-3xl mx-auto mb-24 anim-fade-in" style={{ animationDuration: '0.6s' }}>
+          <div className="inline-flex items-center gap-2 mb-6 hairline px-3 py-1.5"
+               style={{ background: 'color-mix(in srgb, var(--color-primary) 8%, transparent)', borderColor: 'color-mix(in srgb, var(--color-primary) 30%, transparent)' }}>
+            <span className="size-1.5 rounded-full anim-blink" style={{ background: 'var(--color-primary)' }} />
+            <span className="text-[10px] uppercase tracking-[0.24em] font-mono" style={{ color: 'var(--color-primary)' }}>
+              For the office of the CFO
+            </span>
+          </div>
+          <h1 className="font-display tracking-tight leading-[0.95]" style={{ fontSize: 'clamp(48px, 6vw, 72px)', color: 'var(--color-text-primary)' }}>
+            Black Swan War Room
+          </h1>
+          <p className="mt-5 text-[18px]" style={{ color: 'var(--color-text-secondary)' }}>
+            Adaptive crisis reforecasting for the office of the CFO.
+          </p>
+          <p className="mt-6 text-[15px] leading-relaxed max-w-2xl mx-auto" style={{ color: 'var(--color-text-tertiary)' }}>
+            Compress black swan event response from a six-week analysis-and-decision cycle to a single working session.
+            Trace every dollar to its source. Compose mitigations clause-by-clause with stakeholder voting and a live solver.
+          </p>
+        </section>
+
+        {/* CAPABILITY GRID */}
+        <section className="mb-24">
+          <SectionLabel className="mb-4">Capabilities</SectionLabel>
+          <div className="grid grid-cols-3 gap-3">
+            <CapabilityCard
+              icon={Radio}
+              title="Signal Detection"
+              desc="AI continuously scans geopolitical, commodity, and supplier-credit signals."
+              delay={0}
+            />
+            <CapabilityCard
+              icon={Network}
+              title="Cascading Impact Analysis"
+              desc="Trace a shock from signal through suppliers, BOMs, plants, and budget lines to P&L outcomes."
+              delay={80}
+            />
+            <CapabilityCard
+              icon={Database}
+              title="Grounded Quantification"
+              desc="Every dollar figure traces to a model on real data. The LLM narrates; it never invents numbers."
+              delay={160}
+            />
+            <CapabilityCard
+              icon={Sliders}
+              title="Mitigation Workbench"
+              desc="Compose mitigation strategies clause-by-clause with a live constraint solver and stakeholder voting."
+              delay={240}
+            />
+            <CapabilityCard
+              icon={FlaskConical}
+              title="Monte Carlo Uncertainty"
+              desc="5,000-iteration simulation with P10/P50/P90 bands and variance decomposition."
+              delay={320}
+            />
+            <CapabilityCard
+              icon={FileText}
+              title="Board-Ready Output"
+              desc="One-click board pack, full audit trail, and saved-play learning."
+              delay={400}
+            />
+          </div>
+        </section>
+
+        {/* ENTRY PATHS */}
+        <section className="mb-20">
+          <SectionLabel className="mb-4">Choose your data source</SectionLabel>
+          <div className="grid grid-cols-2 gap-4">
+            <EntryDemoCard onLaunch={() => {
+              loadDataset(buildMeridianDataset());
+              useWarRoom.setState({ mode: 'boot' });
+            }} />
+            <EntryUploadCard onLaunch={(uploadedData) => {
+              loadDataset(uploadedData);
+              useWarRoom.setState({ mode: 'boot' });
+            }} />
+          </div>
+        </section>
+
+        {/* Footer disclaimer */}
+        <footer className="text-center text-[11px] leading-relaxed" style={{ color: 'var(--color-text-tertiary)' }}>
+          Prototype. Built on SAP Datasphere + Databricks ML + LLM architecture.
+          Models are simulated in-browser for demonstration; this is not connected to a live SAP system.
+        </footer>
+      </main>
+    </div>
+  );
+}
+
+function ThemeToggle({ theme, setTheme }) {
+  return (
+    <div
+      className="inline-flex items-center hairline p-0.5 gap-0.5"
+      style={{ background: 'var(--color-bg-surface)' }}
+    >
+      {[
+        { id: 'war-room', label: 'War Room' },
+        { id: 'sac-story', label: 'SAC Story' },
+      ].map(opt => {
+        const active = theme === opt.id;
+        return (
+          <button
+            key={opt.id}
+            onClick={() => setTheme(opt.id)}
+            className="px-3 py-1.5 text-[10px] uppercase tracking-[0.18em] font-mono transition-colors"
+            style={{
+              background: active ? 'var(--color-primary)' : 'transparent',
+              color: active ? 'var(--color-text-inverse)' : 'var(--color-text-tertiary)',
+            }}
+          >
+            {opt.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function CapabilityCard({ icon: Icon, title, desc, delay = 0 }) {
+  return (
+    <div
+      className="hairline p-5 transition-all anim-fade-in group"
+      style={{
+        background: 'color-mix(in srgb, var(--color-bg-surface) 60%, transparent)',
+        animationDelay: `${delay}ms`,
+        animationFillMode: 'backwards',
+        animationDuration: '0.5s',
+      }}
+      onMouseEnter={(e) => { e.currentTarget.style.background = 'color-mix(in srgb, var(--color-bg-surface-elevated) 80%, transparent)'; }}
+      onMouseLeave={(e) => { e.currentTarget.style.background = 'color-mix(in srgb, var(--color-bg-surface) 60%, transparent)'; }}
+    >
+      <div className="size-9 hairline flex items-center justify-center mb-3"
+           style={{
+             background: 'color-mix(in srgb, var(--color-primary) 10%, transparent)',
+             borderColor: 'color-mix(in srgb, var(--color-primary) 35%, transparent)',
+           }}>
+        <Icon size={16} style={{ color: 'var(--color-primary)' }} />
+      </div>
+      <div className="font-display text-[15px] leading-tight" style={{ color: 'var(--color-text-primary)' }}>{title}</div>
+      <div className="text-[12px] mt-2 leading-relaxed" style={{ color: 'var(--color-text-tertiary)' }}>{desc}</div>
+    </div>
+  );
+}
+
+function EntryDemoCard({ onLaunch }) {
+  return (
+    <div
+      className="hairline p-7 flex flex-col anim-fade-in"
+      style={{
+        background: 'color-mix(in srgb, var(--color-bg-surface) 70%, transparent)',
+        animationDelay: '500ms',
+        animationFillMode: 'backwards',
+        animationDuration: '0.6s',
+      }}
+    >
+      <div className="flex items-baseline justify-between mb-1">
+        <div className="text-[10px] uppercase tracking-[0.28em] font-mono" style={{ color: 'var(--color-text-tertiary)' }}>Option A</div>
+        <Pill color="info" size="xs">Recommended for first run</Pill>
+      </div>
+      <h3 className="font-display text-[22px] tracking-tight mt-2" style={{ color: 'var(--color-text-primary)' }}>Run the Demo</h3>
+      <p className="text-[13px] mt-3 leading-relaxed flex-1" style={{ color: 'var(--color-text-secondary)' }}>
+        Explore with our built-in example — <span style={{ color: 'var(--color-text-primary)' }}>Meridian Drivetrain Systems</span>,
+        a tier-one auto parts manufacturer facing a Strait of Hormuz disruption. 240 suppliers, 60 budget lines, 12 scripted events.
+      </p>
+      <div className="mt-5 grid grid-cols-3 gap-2 text-[10px] font-mono" style={{ color: 'var(--color-text-tertiary)' }}>
+        <div className="hairline px-2 py-1.5 text-center" style={{ background: 'color-mix(in srgb, var(--color-bg-surface-elevated) 50%, transparent)' }}>$195M rev</div>
+        <div className="hairline px-2 py-1.5 text-center" style={{ background: 'color-mix(in srgb, var(--color-bg-surface-elevated) 50%, transparent)' }}>6 plants</div>
+        <div className="hairline px-2 py-1.5 text-center" style={{ background: 'color-mix(in srgb, var(--color-bg-surface-elevated) 50%, transparent)' }}>240 suppliers</div>
+      </div>
+      <button
+        onClick={onLaunch}
+        className="mt-6 px-5 py-3 text-[12px] uppercase tracking-[0.18em] font-medium flex items-center justify-center gap-2 transition-colors hover:opacity-90"
+        style={{ background: 'var(--color-primary)', color: 'var(--color-text-inverse)' }}
+      >
+        <Play size={13} /> Launch Demo Mode
+        <ArrowRight size={13} />
+      </button>
+    </div>
+  );
+}
+
+function EntryUploadCard({ onLaunch }) {
+  const [result, setResult] = useState(null);   // { ok, errors, warnings, data }
+  const [parsing, setParsing] = useState(false);
+  const [fileName, setFileName] = useState(null);
+  const [dragging, setDragging] = useState(false);
+  const inputRef = useRef(null);
+
+  async function handleFile(file) {
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.xlsx')) {
+      setFileName(file.name);
+      setResult({ ok: false, errors: [{ sheet: '_file', message: 'Only .xlsx files are supported.' }], warnings: [] });
+      return;
+    }
+    setFileName(file.name);
+    setResult(null);
+    setParsing(true);
+    const r = await parseAndValidateWorkbook(file);
+    setParsing(false);
+    setResult(r);
+  }
+
+  function onDrop(e) {
+    e.preventDefault();
+    setDragging(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file) handleFile(file);
+  }
+  function onDragOver(e) { e.preventDefault(); setDragging(true); }
+  function onDragLeave() { setDragging(false); }
+
+  const ready = result?.ok === true;
+  const failed = result && result.ok === false;
+  const companyName = ready ? result.data.source.companyName : null;
+
+  return (
+    <div
+      className="hairline p-7 flex flex-col anim-fade-in"
+      style={{
+        background: 'color-mix(in srgb, var(--color-bg-surface) 70%, transparent)',
+        animationDelay: '600ms',
+        animationFillMode: 'backwards',
+        animationDuration: '0.6s',
+      }}
+    >
+      <div className="flex items-baseline justify-between mb-1">
+        <div className="text-[10px] uppercase tracking-[0.28em] font-mono" style={{ color: 'var(--color-text-tertiary)' }}>Option B</div>
+        <Pill color="paper" size="xs">Bring your own data</Pill>
+      </div>
+      <h3 className="font-display text-[22px] tracking-tight mt-2" style={{ color: 'var(--color-text-primary)' }}>Use Your Own Data</h3>
+      <p className="text-[13px] mt-3 leading-relaxed" style={{ color: 'var(--color-text-secondary)' }}>
+        Upload an Excel workbook with your company's budget, suppliers, and event parameters.
+        The analysis runs on your numbers.
+      </p>
+
+      {/* Drop zone */}
+      <div
+        onClick={() => inputRef.current?.click()}
+        onDrop={onDrop} onDragOver={onDragOver} onDragLeave={onDragLeave}
+        className="mt-5 hairline px-4 py-6 flex flex-col items-center justify-center text-center cursor-pointer transition-all"
+        style={{
+          borderStyle: 'dashed',
+          background: dragging ? 'color-mix(in srgb, var(--color-primary) 12%, transparent)' : 'color-mix(in srgb, var(--color-bg-surface-elevated) 30%, transparent)',
+          borderColor: dragging ? 'var(--color-primary)' : undefined,
+        }}
+      >
+        <input
+          ref={inputRef}
+          type="file"
+          accept=".xlsx"
+          className="hidden"
+          onChange={(e) => handleFile(e.target.files?.[0])}
+        />
+        {parsing ? (
+          <>
+            <Loader2 size={20} className="animate-spin" style={{ color: 'var(--color-primary)' }} />
+            <div className="mt-2 text-[12px] font-mono uppercase tracking-[0.18em]" style={{ color: 'var(--color-primary)' }}>
+              Validating workbook…
+            </div>
+          </>
+        ) : fileName ? (
+          <>
+            <FileText size={20} style={{ color: ready ? 'var(--color-positive)' : failed ? 'var(--color-negative)' : 'var(--color-text-secondary)' }} />
+            <div className="mt-2 text-[12px] font-mono break-all" style={{ color: 'var(--color-text-primary)' }}>{fileName}</div>
+            <div className="text-[10px] uppercase tracking-[0.18em] mt-1" style={{ color: 'var(--color-text-tertiary)' }}>Click or drop a different file to replace</div>
+          </>
+        ) : (
+          <>
+            <Database size={20} style={{ color: 'var(--color-text-tertiary)' }} />
+            <div className="mt-2 text-[12px] font-mono uppercase tracking-[0.18em]" style={{ color: 'var(--color-text-secondary)' }}>
+              Drop .xlsx here, or click to browse
+            </div>
+            <div className="text-[10px] mt-1" style={{ color: 'var(--color-text-tertiary)' }}>
+              Excel workbook · 8 sheets (Company, Budget_Lines, Suppliers, Events, …)
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Validation panel */}
+      {result && <ValidationPanel result={result} />}
+
+      {/* Launch + template */}
+      <div className="mt-5 flex items-center gap-3">
+        <button
+          onClick={() => ready && onLaunch(result.data)}
+          disabled={!ready}
+          className="flex-1 px-5 py-3 text-[12px] uppercase tracking-[0.18em] font-medium flex items-center justify-center gap-2 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+          style={{
+            background: ready ? 'var(--color-primary)' : 'var(--color-bg-surface-elevated)',
+            color: ready ? 'var(--color-text-inverse)' : 'var(--color-text-tertiary)',
+          }}
+        >
+          {ready
+            ? <><Play size={13} /> Launch with {companyName} <ArrowRight size={13} /></>
+            : <><Power size={13} /> Upload to launch</>}
+        </button>
+      </div>
+      <a
+        href="/Black_Swan_Demo_Data.xlsx"
+        download
+        className="mt-3 text-[11px] underline underline-offset-2 inline-flex items-center gap-1.5 w-fit transition-colors"
+        style={{ color: 'var(--color-text-secondary)' }}
+        onMouseEnter={(e) => e.currentTarget.style.color = 'var(--color-primary)'}
+        onMouseLeave={(e) => e.currentTarget.style.color = 'var(--color-text-secondary)'}
+      >
+        <Download size={11} /> Download the data template (.xlsx)
+      </a>
+    </div>
+  );
+}
+
+function ValidationPanel({ result }) {
+  const { ok, errors, warnings, data } = result;
+
+  if (ok) {
+    const counts = `${data.budgetLines.length} budget lines · ${data.suppliers.length} suppliers · ${data.events.length} events`;
+    return (
+      <div className="mt-4 hairline px-3 py-2.5"
+           style={{
+             background: 'color-mix(in srgb, var(--color-positive) 8%, transparent)',
+             borderColor: 'color-mix(in srgb, var(--color-positive) 40%, transparent)',
+           }}>
+        <div className="flex items-center gap-2">
+          <CheckCircle2 size={14} style={{ color: 'var(--color-positive)' }} />
+          <div className="text-[11.5px]" style={{ color: 'var(--color-text-primary)' }}>
+            <span style={{ color: 'var(--color-positive)' }} className="font-mono uppercase tracking-[0.16em] text-[10px] mr-1.5">Valid</span>
+            {counts}
+          </div>
+        </div>
+        {warnings.length > 0 && (
+          <div className="mt-2 space-y-1">
+            {warnings.map((w, i) => (
+              <div key={i} className="text-[10.5px] flex items-start gap-1.5" style={{ color: 'var(--color-warn)' }}>
+                <span className="font-mono uppercase tracking-[0.14em] flex-none">[{w.sheet}]</span>
+                <span>{w.message}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Group errors by sheet
+  const bySheet = {};
+  for (const e of errors) {
+    if (!bySheet[e.sheet]) bySheet[e.sheet] = [];
+    bySheet[e.sheet].push(e);
+  }
+
+  return (
+    <div className="mt-4 hairline px-3 py-2.5"
+         style={{
+           background: 'color-mix(in srgb, var(--color-negative) 8%, transparent)',
+           borderColor: 'color-mix(in srgb, var(--color-negative) 40%, transparent)',
+         }}>
+      <div className="flex items-center gap-2 mb-2">
+        <XCircle size={14} style={{ color: 'var(--color-negative)' }} />
+        <div className="text-[11.5px]" style={{ color: 'var(--color-text-primary)' }}>
+          <span style={{ color: 'var(--color-negative)' }} className="font-mono uppercase tracking-[0.16em] text-[10px] mr-1.5">Errors</span>
+          {errors.length} issue{errors.length === 1 ? '' : 's'} — fix and re-upload
+        </div>
+      </div>
+      <div className="space-y-2 max-h-[200px] overflow-y-auto">
+        {Object.entries(bySheet).map(([sheet, items]) => (
+          <div key={sheet}>
+            <div className="text-[10px] uppercase tracking-[0.18em] font-mono mb-1" style={{ color: 'var(--color-text-tertiary)' }}>
+              {sheet === '_file' ? 'File' : sheet}
+            </div>
+            <ul className="space-y-0.5 ml-2">
+              {items.map((e, i) => (
+                <li key={i} className="text-[11px] flex items-start gap-1.5" style={{ color: 'var(--color-text-secondary)' }}>
+                  {e.row && <span className="font-mono flex-none" style={{ color: 'var(--color-text-tertiary)' }}>row {e.row}:</span>}
+                  <span>{e.message}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const { mode, tickTimer, alertFiredAt } = useWarRoom();
 
@@ -4874,7 +6041,8 @@ export default function App() {
     return () => clearInterval(t);
   }, [alertFiredAt, tickTimer]);
 
-  if (mode === 'boot') return <BootSequence />;
+  if (mode === 'landing') return <LandingPage />;
+  if (mode === 'boot')    return <BootSequence />;
 
   return (
     <div className="h-screen w-screen flex flex-col bg-ink-50 text-paper-100 relative overflow-hidden">
@@ -4899,16 +6067,17 @@ export default function App() {
 }
 
 function Footer() {
+  const { fy, source } = useWarRoom(s => ({ fy: s.data.company.fy, source: s.data.source }));
   return (
     <footer className="hairline-t bg-ink-100/60 px-5 py-1.5 flex items-center justify-between text-[9px] uppercase tracking-[0.22em] text-paper-500 font-mono">
       <div className="flex items-center gap-4">
-        <span className="flex items-center gap-1.5"><span className="size-1.5 rounded-full bg-stable anim-blink" /> Datasphere · Connected</span>
+        <span className="flex items-center gap-1.5"><span className="size-1.5 rounded-full bg-stable anim-blink" /> {source.type === 'upload' ? 'Workbook · Loaded' : 'Datasphere · Connected'}</span>
         <span>Last sync 02:14 UTC</span>
-        <span>{COMPANY.fy} · AMER-EAST</span>
+        <span>{fy} · AMER-EAST</span>
       </div>
       <div className="flex items-center gap-4">
         <span>Cmd+Shift+D · Demo Controls</span>
-        <span className="text-amber-400">Demo Mode · PwC Hackathon</span>
+        <span className="text-amber-400">{source.type === 'upload' ? `Uploaded · ${source.fileName}` : 'Demo Mode'}</span>
       </div>
     </footer>
   );
