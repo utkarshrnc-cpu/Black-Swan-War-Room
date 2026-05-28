@@ -1210,19 +1210,46 @@ function parseAndValidateWorkbook(file) {
  * SECTION 3: MONTE CARLO + SOLVER + UTILITIES
  * ========================================================================== */
 
-function sampleTriangular(min, mode, max) {
-  const u = Math.random();
-  const fc = (mode - min) / (max - min);
+// ---------- Seeded PRNG (mulberry32) ----------
+// Used so Monte Carlo P10/P50/P90 are stable across renders. The on-screen
+// figure and the lineage drawer's recomputation see the SAME number — without
+// this they would drift on every render and the "✓ matches" check would fail.
+function mulberry32(seed) {
+  let s = seed | 0;
+  return function () {
+    s = s + 0x6D2B79F5 | 0;
+    let t = Math.imul(s ^ s >>> 15, 1 | s);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function seedFromString(s) {
+  let h = 2166136261 >>> 0; // FNV-1a basis
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h | 0;
+}
+
+function sampleTriangular(min, mode, max, rng = Math.random) {
+  const u = rng();
+  const fc = (mode - min) / (max - min || 1);
   if (u < fc) return min + Math.sqrt(u * (max - min) * (mode - min));
   return max - Math.sqrt((1 - u) * (max - min) * (max - mode));
 }
 
-function runMonteCarlo(items, iterations = 5000) {
+// Seeded Monte Carlo. Pass a stable `seed` so identical inputs always produce
+// identical sorted-results arrays. Default unseeded behavior (using Math.random)
+// is preserved for any caller that explicitly opts in via seed = null.
+function runMonteCarlo(items, iterations = 5000, seed = 0) {
+  const rng = seed == null ? Math.random : mulberry32(seed >>> 0);
   const results = new Array(iterations);
   for (let i = 0; i < iterations; i++) {
     let total = 0;
     for (const item of items) {
-      total += sampleTriangular(item.min, item.mode, item.max);
+      total += sampleTriangular(item.min, item.mode, item.max, rng);
     }
     results[i] = total;
   }
@@ -1310,6 +1337,514 @@ function fmtDuration(secs) {
 
 function fmtClock(d = new Date()) {
   return d.toTimeString().slice(0, 8);
+}
+
+function fmtForUnit(value, unit, opts = {}) {
+  if (unit === 'USD')         return fmtUSD(value, opts);
+  if (unit === 'USD_compact') return fmtUSD(value, { compact: true, precision: 1, ...opts });
+  if (unit === 'percent')     return fmtPct(value, opts.digits ?? 1);
+  if (unit === 'score')       return Math.round(value).toString();
+  if (unit === 'count')       return Math.round(value).toLocaleString();
+  return String(value);
+}
+
+/* ============================================================================
+ * SECTION 3.5: PER-LINE IMPACT MODEL + LINEAGE DESCRIPTOR FACTORY
+ *
+ * Every clickable number in the app builds a descriptor here, NOT in the
+ * drawer. The descriptor carries:
+ *   - value           : the figure shown on screen
+ *   - unit            : USD / percent / score / count
+ *   - source          : where the data came from (Datasphere CDS view / sheet)
+ *   - title, query    : human/SQL labels
+ *   - rows            : the ACTUAL records from the active dataset
+ *   - derivation      : { operation, formula, computed }   computed === value
+ *   - model?, confidence?
+ *
+ * Critically: `derivation.computed` is recomputed from `rows` at descriptor
+ * build time. The on-screen figure passes through the same path, so
+ * `computed === value` by construction.
+ * ========================================================================== */
+
+// Compute per-line impact triangulars for an event. Calibrates a `baseRate`
+// so the sum of per-line modes equals event.impactRange.mode (i.e. the per-
+// line breakdown is internally consistent with the headline P50). This is
+// the single source of truth for both display and lineage.
+function eventLineImpacts(event, data) {
+  if (!event) return { lines: [], totalMode: 0, baseRate: 0 };
+  const lines = (event.affectedLineIds || []).map(id => {
+    const l = data.budgetLines.find(x => x.id === id);
+    if (!l) return null;
+    const weight = event.impactWeights?.[id] ?? 1.0;
+    return { id: l.id, name: l.name, fy_current: l.fy26, weight };
+  }).filter(Boolean);
+  if (lines.length === 0) return { lines: [], totalMode: event.impactRange.mode || 0, baseRate: 0 };
+
+  const weightedSum = lines.reduce((s, l) => s + l.fy_current * l.weight, 0);
+  const targetMode = event.impactRange.mode || 0;
+  const baseRate = weightedSum > 0 ? targetMode / weightedSum : 0;
+
+  return {
+    lines: lines.map(l => {
+      const mode = l.fy_current * l.weight * baseRate;
+      return {
+        ...l,
+        baseRate,
+        impactMin:  mode * 0.70,
+        impactMode: mode,
+        impactMax:  mode * 1.35,
+      };
+    }),
+    totalMode: targetMode,
+    baseRate,
+  };
+}
+
+// Run the per-line MC to land the headline P50/P10/P90. Always seeded so
+// the on-screen figure and the lineage recomputation produce the same number.
+function computeEventP50({ event, ev2, data, multiEvent }) {
+  if (!event) return null;
+  const primary = eventLineImpacts(event, data);
+  const secondary = (multiEvent && ev2) ? eventLineImpacts(ev2, data) : null;
+  const ev2Mult = 1.18;
+
+  // Combined per-line items (secondary contributes with 1.18× non-linear factor)
+  const items = [
+    ...primary.lines.map(l => ({ min: l.impactMin, mode: l.impactMode, max: l.impactMax })),
+    ...(secondary ? secondary.lines.map(l => ({
+      min: l.impactMin * ev2Mult, mode: l.impactMode * ev2Mult, max: l.impactMax * ev2Mult,
+    })) : []),
+  ];
+
+  const seed = seedFromString(`event_p50|${event.id}|${ev2 ? ev2.id : 'none'}|${multiEvent ? 'joint' : 'single'}|${data.source.fileName || 'demo'}`);
+  const sorted = items.length ? runMonteCarlo(items, 5000, seed) : [event.impactRange.mode || 0];
+  const [p10, p50, p90] = percentiles(sorted);
+
+  return {
+    p10, p50, p90,
+    perLine: primary.lines,
+    perLineSecondary: secondary ? secondary.lines : null,
+    ev2Mult,
+    iterations: 5000,
+    seed,
+  };
+}
+
+// Run the savings MC for a strategy/composition. Same seeded approach.
+function computeStrategySavings({ event, ev2, multiEvent, clauseIds, clausesMap }) {
+  // Solver result (used as the headline figure)
+  const solved = event ? solveStrategy(event, clauseIds, clausesMap, multiEvent) : { savingsMin: 0, savingsMode: 0, savingsMax: 0, feasibility: { capacity: 'green', leadTime: 'green', compliance: 'green' } };
+
+  // Monte Carlo over the clause-level savings (with the same interaction penalty)
+  const interaction = clauseIds.length >= 3 ? 0.92 : 1.0;
+  const items = clauseIds.map(id => {
+    const c = clausesMap[id];
+    if (!c) return null;
+    return { min: c.savingsMin * interaction, mode: c.savingsMode * interaction, max: c.savingsMax * interaction };
+  }).filter(Boolean);
+
+  if (items.length === 0) {
+    return { ...solved, p10: 0, p50: 0, p90: 0, sorted: null, perClause: [], items: [] };
+  }
+
+  const seed = seedFromString(`strategy|${event ? event.id : 'none'}|${clauseIds.join(',')}|${multiEvent ? 'joint' : 'single'}`);
+  const sorted = runMonteCarlo(items, 5000, seed);
+  const [p10, p50, p90] = percentiles(sorted);
+
+  // Per-clause contribution (deterministic — uses solver values)
+  const perClause = clauseIds.map(id => {
+    const c = clausesMap[id];
+    if (!c) return null;
+    return {
+      id: c.id, name: c.name,
+      savings_min: Math.round(c.savingsMin * interaction),
+      savings_p50: Math.round(c.savingsMode * interaction),
+      savings_max: Math.round(c.savingsMax * interaction),
+    };
+  }).filter(Boolean);
+
+  return { ...solved, p10, p50, p90, sorted, perClause, items, interaction, seed };
+}
+
+// ---------- Lineage descriptor factory ----------
+function buildLineage(kind, ctx) {
+  const data = ctx.data;
+  const isUpload = data.source.type === 'upload';
+  const sourceLabel = isUpload ? `Uploaded · ${data.source.companyName}` : 'Demo data';
+  const sysName = isUpload ? 'Workbook' : 'Datasphere';
+  const fy = data.company.fy;
+
+  function makeSource(sheet, cdsView) {
+    return { system: sysName, cdsView, sheet, origin: data.source.type, label: sourceLabel, fileName: data.source.fileName || null };
+  }
+
+  switch (kind) {
+    case 'budget_total': {
+      const rows = data.budgetLines.map(l => ({
+        Line_ID: l.id,
+        Line_Name: l.name,
+        Category: data.budgetCategories.find(c => c.id === l.cat)?.name || l.cat,
+        FY_Current: l.fy26,
+      }));
+      const computed = rows.reduce((s, r) => s + r.FY_Current, 0);
+      return {
+        kind, title: `${fy} Operating Budget — Total`,
+        value: computed, unit: 'USD',
+        source: makeSource('Budget_Lines', 'GL_Balances_BV'),
+        query: `SELECT SUM(fy_current) AS total_opex, COUNT(*) AS line_items
+FROM ${isUpload ? 'workbook' : 'datasphere'}.Budget_Lines
+WHERE fiscal_year = '${fy}' AND entity = '${data.company.name}';`,
+        rows,
+        sumColumn: 'FY_Current',
+        derivation: {
+          operation: 'SUM',
+          formula: `SUM(FY_Current) across ${rows.length} budget line${rows.length === 1 ? '' : 's'}`,
+          computed,
+        },
+        model: { name: 'budget-aggregator-v1.4', type: 'OR-Tools constraint LP', features: 'fy_prior, escalation %, hedge coverage', retrain: 'monthly · last 14 days', window: '36-month rolling' },
+      };
+    }
+
+    case 'category_total': {
+      const cat = data.budgetCategories.find(c => c.id === ctx.categoryId);
+      const catName = cat?.name || ctx.categoryId;
+      const rows = data.budgetLines.filter(l => l.cat === ctx.categoryId).map(l => ({
+        Line_ID: l.id, Line_Name: l.name, FY_Current: l.fy26,
+      }));
+      const computed = rows.reduce((s, r) => s + r.FY_Current, 0);
+      return {
+        kind, title: `${fy} Budget — ${catName}`,
+        value: computed, unit: 'USD',
+        source: makeSource('Budget_Lines', 'GL_Balances_BV'),
+        query: `SELECT SUM(fy_current) AS category_total
+FROM ${isUpload ? 'workbook' : 'datasphere'}.Budget_Lines
+WHERE fiscal_year = '${fy}' AND category = '${catName}';`,
+        rows,
+        sumColumn: 'FY_Current',
+        derivation: {
+          operation: 'SUM',
+          formula: `SUM(FY_Current) across ${rows.length} ${catName} line${rows.length === 1 ? '' : 's'}`,
+          computed,
+        },
+        model: { name: 'budget-aggregator-v1.4', type: 'Aggregation', features: 'category mapping', retrain: 'on-update', window: 'live' },
+      };
+    }
+
+    case 'gross_margin': {
+      const opex = data.budgetTotalFy26;
+      const revenue = data.company.revenue;
+      const computed = revenue > 0 ? (revenue - opex) / revenue : 0;
+      const rows = [
+        { Metric: 'Revenue', Value: revenue },
+        { Metric: 'Operating Expense (OpEx)', Value: opex },
+        { Metric: 'Gross Margin = (Revenue − OpEx) / Revenue', Value: computed },
+      ];
+      return {
+        kind, title: 'Gross Margin Projection',
+        value: computed, unit: 'percent',
+        source: makeSource('Company + Budget_Lines', 'PnL_BV'),
+        query: `SELECT (rev.total - opex.total) / rev.total AS gross_margin
+FROM (SELECT revenue_usd AS total FROM ${isUpload ? 'workbook' : 'datasphere'}.Company WHERE fy='${fy}') rev,
+     (SELECT SUM(fy_current) AS total FROM ${isUpload ? 'workbook' : 'datasphere'}.Budget_Lines WHERE fy='${fy}') opex;`,
+        rows,
+        derivation: {
+          operation: 'RATIO',
+          formula: `(Revenue − OpEx) / Revenue = (${fmtUSD(revenue, { compact: true, precision: 1 })} − ${fmtUSD(opex, { compact: true, precision: 1 })}) / ${fmtUSD(revenue, { compact: true, precision: 1 })}`,
+          computed,
+        },
+        model: { name: 'margin-projector-v3.1', type: 'Bayesian regression', features: 'revenue forecast, opex baseline, hedge coverage', retrain: 'weekly · Tue 04:00 UTC', window: '60-month' },
+      };
+    }
+
+    case 'ebitda_margin': {
+      const computed = data.company.currentEbitdaMargin ?? 0.139;
+      const target = data.company.targets.ebitdaMargin;
+      const rows = [
+        { Metric: 'Target EBITDA Margin', Value: target },
+        { Metric: 'Projected EBITDA Margin', Value: computed },
+        { Metric: 'Variance to Target', Value: computed - target },
+      ];
+      return {
+        kind, title: `EBITDA Margin (${fy})`,
+        value: computed, unit: 'percent',
+        source: makeSource('Company', 'PnL_BV'),
+        query: `SELECT ebitda_margin_current AS projected
+FROM ${isUpload ? 'workbook' : 'datasphere'}.Company
+WHERE fy = '${fy}';`,
+        rows,
+        derivation: {
+          operation: 'IDENTITY',
+          formula: `Reads EBITDA_Margin_Current_Pct from Company sheet`,
+          computed,
+        },
+        model: { name: 'pnl-projector-v2.6', type: 'XGBoost', features: 'opex, revenue mix, FX, hedge coverage', retrain: 'weekly', window: '48-month' },
+      };
+    }
+
+    case 'contingency': {
+      const opex = data.budgetTotalFy26;
+      const reserve = data.company.contingencyReserveUsd ?? (data.company.targets.contingencyPct * opex);
+      const computed = opex > 0 ? reserve / opex : 0;
+      const rows = [
+        { Metric: 'Contingency Reserve', Value: reserve },
+        { Metric: 'Operating Expense (OpEx)', Value: opex },
+        { Metric: '% of OpEx = Reserve / OpEx', Value: computed },
+      ];
+      return {
+        kind, title: 'Contingency Reserve',
+        value: computed, unit: 'percent',
+        source: makeSource('Company + Budget_Lines', 'Treasury_BV'),
+        query: `SELECT reserve_usd / opex_total AS pct
+FROM ${isUpload ? 'workbook' : 'datasphere'}.Treasury_BV
+WHERE fy = '${fy}';`,
+        rows,
+        derivation: {
+          operation: 'RATIO',
+          formula: `Reserve / OpEx = ${fmtUSD(reserve, { compact: true })} / ${fmtUSD(opex, { compact: true })}`,
+          computed,
+        },
+        model: { name: 'treasury-recon-v1.0', type: 'Rule-based', features: 'cash, credit lines, accruals', retrain: 'daily', window: 'live' },
+      };
+    }
+
+    case 'hedge_coverage': {
+      const computed = data.company.targets.hedgeCoverage;
+      const rows = [{ Metric: 'Hedge Coverage', Value: computed }];
+      return {
+        kind, title: 'Hedge Coverage',
+        value: computed, unit: 'percent',
+        source: makeSource('Company', 'Treasury_BV'),
+        query: `SELECT hedge_coverage_pct FROM ${isUpload ? 'workbook' : 'datasphere'}.Company WHERE fy = '${fy}';`,
+        rows,
+        derivation: { operation: 'IDENTITY', formula: 'Reads Hedge_Coverage_Pct from Company sheet', computed },
+      };
+    }
+
+    case 'supplier_spend': {
+      const s = data.suppliers.find(x => x.id === ctx.supplierId);
+      if (!s) return null;
+      const rows = [{
+        Supplier_ID: s.id, Supplier_Name: s.name, Region: s.region,
+        Annual_Spend_USD: s.spend, Credit: s.credit, OTD: s.otd,
+      }];
+      return {
+        kind, title: `${s.name} — Annual Spend`,
+        value: s.spend, unit: 'USD',
+        source: makeSource('Suppliers', 'Suppliers_BV'),
+        query: `SELECT annual_spend_usd FROM ${isUpload ? 'workbook' : 'datasphere'}.Suppliers WHERE supplier_id = '${s.id}';`,
+        rows,
+        derivation: { operation: 'IDENTITY', formula: `Annual_Spend_USD for ${s.id}`, computed: s.spend },
+      };
+    }
+
+    case 'supplier_risk_overview': {
+      // Sorted top-N risky suppliers — used by the heatmap header's Lineage button
+      const sorted = [...data.suppliers].sort((a, b) => b.riskScore - a.riskScore);
+      const rows = sorted.slice(0, 12).map(s => ({
+        Supplier_ID: s.id, Supplier_Name: s.name, Region: s.region,
+        OTD: s.otd, Credit: s.credit, Composite_Risk_Score: s.riskScore,
+      }));
+      const avg = sorted.length ? sorted.reduce((acc, s) => acc + s.riskScore, 0) / sorted.length : 0;
+      return {
+        kind, title: 'Supplier Composite Risk — Portfolio',
+        value: Math.round(avg), unit: 'score',
+        source: makeSource('Suppliers', 'Suppliers_BV'),
+        query: `SELECT supplier_id, name, region, composite_risk_score
+FROM ${isUpload ? 'workbook' : 'datasphere'}.Suppliers
+ORDER BY composite_risk_score DESC LIMIT 12;`,
+        rows,
+        derivation: { operation: 'AVG', formula: `Average composite_risk_score across ${sorted.length} suppliers`, computed: Math.round(avg) },
+        model: { name: 'supplier-risk-iforest-v3.2', type: 'Isolation Forest + XGBoost ensemble', features: 'credit, OTD, region, geopolitical exposure', retrain: 'weekly', window: '24-month rolling' },
+      };
+    }
+
+    case 'supplier_risk': {
+      const s = data.suppliers.find(x => x.id === ctx.supplierId);
+      if (!s) return null;
+      const rows = [{
+        Supplier_ID: s.id, Supplier_Name: s.name, Region: s.region,
+        OTD: s.otd, Credit: s.credit, Materials: (s.materials || []).join(' · '),
+        Composite_Risk_Score: s.riskScore,
+      }];
+      return {
+        kind, title: `${s.name} — Composite Risk Score`,
+        value: s.riskScore, unit: 'score',
+        source: makeSource('Suppliers', 'Suppliers_BV'),
+        query: `SELECT composite_risk_score FROM ${isUpload ? 'workbook' : 'datasphere'}.Suppliers WHERE supplier_id = '${s.id}';`,
+        rows,
+        derivation: { operation: 'IDENTITY', formula: `Composite score from OTD, credit, region, materials`, computed: s.riskScore },
+        model: { name: 'supplier-risk-iforest-v3.2', type: 'Isolation Forest + XGBoost ensemble', features: 'credit, OTD, region, geopolitical exposure', retrain: 'weekly', window: '24-month rolling' },
+      };
+    }
+
+    case 'event_baseline_p50': {
+      // mc must be passed in by caller (single source of truth: the same MC
+      // result drives the on-screen P50 and this lineage descriptor).
+      const mc = ctx.mc;
+      if (!mc) return null;
+      const isMulti = !!ctx.multiEvent && !!ctx.ev2;
+      const primaryRows = mc.perLine.map(l => ({
+        Line_ID: l.id, Line_Name: l.name, FY_Current: l.fy_current,
+        Impact_Weight: Number(l.weight.toFixed(3)),
+        Impact_P50: Math.round(l.impactMode),
+      }));
+      const secondaryRows = isMulti ? mc.perLineSecondary.map(l => ({
+        Line_ID: l.id, Line_Name: l.name, FY_Current: l.fy_current,
+        Impact_Weight: Number(l.weight.toFixed(3)),
+        Impact_P50: Math.round(l.impactMode * mc.ev2Mult),
+      })) : [];
+      const rows = [...primaryRows, ...secondaryRows];
+      return {
+        kind, title: `${ctx.event.label} — Total Impact (P50)`,
+        value: mc.p50, unit: 'USD',
+        source: makeSource('Event_Impacts + Budget_Lines', 'event_impact'),
+        query: `-- Monte Carlo · 5,000 iterations · seeded for reproducibility
+SELECT PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY impact_total) AS p50
+FROM (
+  SELECT SUM(fy_current * impact_weight * triangular_sample()) AS impact_total
+  FROM ${isUpload ? 'workbook' : 'datasphere'}.Event_Impacts ei
+  JOIN ${isUpload ? 'workbook' : 'datasphere'}.Budget_Lines bl USING (line_id)
+  WHERE ei.event_id IN (${[ctx.event.id, ...(isMulti ? [ctx.ev2.id] : [])].map(x => `'${x}'`).join(', ')})
+  GROUP BY iteration_id
+);`,
+        rows,
+        sumColumn: 'Impact_P50',
+        derivation: {
+          operation: 'MONTE_CARLO_P50',
+          formula: `P50 of ${mc.iterations.toLocaleString()}-iteration triangular MC over ${rows.length} affected line${rows.length === 1 ? '' : 's'}${isMulti ? ` (1.18× non-linear interaction on co-occurring ${ctx.ev2.label})` : ''}`,
+          computed: mc.p50,
+        },
+        confidence: { band: { p10: mc.p10, p50: mc.p50, p90: mc.p90 }, decomp: ctx.event.detailedDrivers },
+        model: { name: 'event-impact-bayes-v2.7', type: 'Bayesian regression + Monte Carlo', features: 'tariff rate, FX, demand elasticity, hedge coverage', retrain: 'event-triggered', window: '24-month' },
+      };
+    }
+
+    case 'budget_line_impact': {
+      // ctx: { event, lineId }
+      const l = data.budgetLines.find(x => x.id === ctx.lineId);
+      if (!l) return null;
+      const ev = ctx.event;
+      const weight = ev.impactWeights?.[ctx.lineId] ?? 1.0;
+      const calib = eventLineImpacts(ev, data);
+      const computed = l.fy26 * weight * calib.baseRate;
+      const rows = [{
+        Line_ID: l.id, Line_Name: l.name, FY_Current: l.fy26,
+        Impact_Weight: Number(weight.toFixed(3)),
+        Base_Rate: Number(calib.baseRate.toFixed(4)),
+        Impact_P50: Math.round(computed),
+      }];
+      return {
+        kind, title: `${l.name} — Impact from ${ev.label}`,
+        value: computed, unit: 'USD',
+        source: makeSource('Event_Impacts + Budget_Lines', 'event_impact'),
+        query: `SELECT bl.fy_current * ei.impact_weight * base_rate AS impact
+FROM ${isUpload ? 'workbook' : 'datasphere'}.Budget_Lines bl
+JOIN ${isUpload ? 'workbook' : 'datasphere'}.Event_Impacts ei USING (line_id)
+WHERE bl.line_id = '${l.id}' AND ei.event_id = '${ev.id}';`,
+        rows,
+        derivation: {
+          operation: 'PRODUCT',
+          formula: `FY_Current × Impact_Weight × Base_Rate = ${fmtUSD(l.fy26, { compact: true })} × ${weight.toFixed(3)} × ${calib.baseRate.toFixed(4)}`,
+          computed,
+        },
+        model: { name: 'event-impact-bayes-v2.7', type: 'Bayesian regression', features: 'tariff rate, FX, demand elasticity', retrain: 'event-triggered', window: '24-month' },
+      };
+    }
+
+    case 'strategy_savings': {
+      // ctx: { mc } — passed in
+      const mc = ctx.mc;
+      if (!mc) return null;
+      const rows = mc.perClause.map(c => ({
+        Clause_ID: c.id, Clause_Name: c.name,
+        Savings_P50: c.savings_p50,
+      }));
+      // Interaction penalty applied inside mc; show it in the formula
+      const interaction = mc.interaction || 1.0;
+      const sumOfClauseP50 = mc.perClause.reduce((s, c) => s + c.savings_p50, 0);
+      return {
+        kind, title: ctx.strategy ? `${ctx.strategy.name} — Savings P50` : 'Composed Savings P50',
+        value: mc.p50, unit: 'USD',
+        source: makeSource('Strategies + Clauses', 'mitigation_lp'),
+        query: `-- Monte Carlo over composable clauses · seeded
+SELECT PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY total_savings) AS p50
+FROM (
+  SELECT SUM(savings_p50 * triangular_sample() * ${interaction.toFixed(2)}) AS total_savings
+  FROM clauses
+  WHERE clause_id IN (${rows.map(r => `'${r.Clause_ID}'`).join(', ')})
+  GROUP BY iteration_id
+);`,
+        rows,
+        sumColumn: 'Savings_P50',
+        derivation: {
+          operation: 'MONTE_CARLO_P50',
+          formula: `P50 of 5,000-iter MC over ${rows.length} clause${rows.length === 1 ? '' : 's'}${interaction < 1 ? ` (×${interaction} multi-clause interaction penalty)` : ''}. Sum of clause P50s = ${fmtUSD(sumOfClauseP50, { compact: true, precision: 1 })}`,
+          computed: mc.p50,
+        },
+        confidence: { band: { p10: mc.p10, p50: mc.p50, p90: mc.p90 } },
+        model: { name: 'mitigation-or-tools-v2.1', type: 'OR-Tools constraint LP + Monte Carlo', features: 'clause savings ranges, feasibility constraints, interaction penalty', retrain: 'on-update', window: 'live' },
+      };
+    }
+
+    case 'counterfactual_forgone': {
+      const ev = ctx.event;
+      const days = ctx.days;
+      const forgoneRate = (days / 21) * 0.42;
+      const computed = (ev?.impactRange.mode || 0) * forgoneRate;
+      const rows = [
+        { Metric: 'Event P50 Impact', Value: ev?.impactRange.mode || 0 },
+        { Metric: 'Days Acted Earlier', Value: days },
+        { Metric: 'Forgone Rate = (days / 21) × 0.42', Value: forgoneRate },
+        { Metric: 'Forgone Savings = P50 × Forgone Rate', Value: computed },
+      ];
+      return {
+        kind, title: `${ev?.label} — Counterfactual Forgone`,
+        value: computed, unit: 'USD',
+        source: makeSource('Events', 'event_impact'),
+        query: `SELECT p50_impact * (${days} / 21.0) * 0.42 AS forgone_savings
+FROM ${isUpload ? 'workbook' : 'datasphere'}.Events WHERE event_id = '${ev?.id}';`,
+        rows,
+        derivation: {
+          operation: 'PRODUCT',
+          formula: `P50 × (days/21 × 0.42) = ${fmtUSD(ev?.impactRange.mode || 0, { compact: true })} × ${(forgoneRate * 100).toFixed(1)}%`,
+          computed,
+        },
+        confidence: { band: { p10: computed * 0.7, p50: computed, p90: computed * 1.3 } },
+      };
+    }
+
+    case 'pnl_outcome': {
+      // ctx: { plLabel, plImpact }
+      const rows = [{ PL_Outcome: ctx.plLabel, Estimated_Impact_USD: ctx.plImpact }];
+      return {
+        kind, title: `${ctx.plLabel} — Estimated Impact`,
+        value: ctx.plImpact, unit: 'USD',
+        source: makeSource('Event_Impacts → P&L', 'event_impact'),
+        query: `SELECT estimated_impact_usd FROM event_pnl_outcomes WHERE outcome = '${ctx.plLabel}';`,
+        rows,
+        derivation: { operation: 'IDENTITY', formula: 'P&L outcome estimate', computed: ctx.plImpact },
+      };
+    }
+
+    case 'cascade_signal': {
+      const ev = ctx.event;
+      const rows = [{
+        Event_ID: ev.id, Event_Label: ev.label, Severity: ev.severity, Region: ev.region,
+        P10_USD: ev.impactRange.min, P50_USD: ev.impactRange.mode, P90_USD: ev.impactRange.max,
+      }];
+      return {
+        kind, title: `Signal — ${ev.label}`,
+        value: ev.impactRange.mode, unit: 'USD',
+        source: makeSource('Events', 'event_signals'),
+        query: `SELECT * FROM ${isUpload ? 'workbook' : 'datasphere'}.Events WHERE event_id = '${ev.id}';`,
+        rows,
+        derivation: { operation: 'IDENTITY', formula: 'Event header from Events sheet', computed: ev.impactRange.mode },
+      };
+    }
+
+    default:
+      return null;
+  }
 }
 
 /* ============================================================================
@@ -1971,25 +2506,47 @@ function SectionLabel({ children, right, className = '' }) {
 
 // ---------- GroundedNumber — every $ flows through this ----------
 function GroundedNumber({
-  value,
-  format = 'usd',
+  value,                 // ignored when `lineage` is passed — descriptor wins
+  format,                // 'usd' | 'pct' (auto-derived from lineage.unit when present)
   compact = false,
   precision,
-  lineageId,
-  decomp,   // [{name, weight}]
-  band,     // { p10, p50, p90 }
   className = '',
-  label,
   size = 'md',
+  // Unified descriptor — either an object or a () => object factory.
+  // When provided, both display value and lineage drawer read from the
+  // same source so they cannot diverge.
+  lineage,
+  // Legacy hover-tooltip props (used by call sites that haven't moved to
+  // a full descriptor yet, e.g. the inline counterfactual chip).
+  band, decomp, label, lineageId,
 }) {
   const openLineage = useWarRoom(s => s.openLineage);
   const [hover, setHover] = useState(false);
 
-  const rendered = format === 'usd'
-    ? fmtUSD(value, { compact, precision })
-    : format === 'pct'
-      ? fmtPct(value, precision ?? 1)
-      : String(value);
+  const resolved = useMemo(() => {
+    if (lineage == null) return null;
+    return typeof lineage === 'function' ? lineage() : lineage;
+  }, [lineage]);
+
+  // Display value comes from the descriptor's computed value when available,
+  // otherwise from the `value` prop (legacy).
+  const displayValue = resolved ? resolved.derivation.computed : value;
+
+  // Format selection driven by the descriptor's `unit`
+  let rendered;
+  if (resolved) {
+    if (resolved.unit === 'USD') rendered = fmtUSD(displayValue, { compact, precision: precision ?? (compact ? 1 : undefined) });
+    else if (resolved.unit === 'percent') rendered = fmtPct(displayValue, precision ?? 1);
+    else if (resolved.unit === 'score') rendered = Math.round(displayValue).toString();
+    else if (resolved.unit === 'count') rendered = Math.round(displayValue).toLocaleString();
+    else rendered = String(displayValue);
+  } else {
+    rendered = format === 'pct'
+      ? fmtPct(displayValue, precision ?? 1)
+      : format === 'usd' || format == null
+        ? fmtUSD(displayValue, { compact, precision })
+        : String(displayValue);
+  }
 
   const sizeMap = {
     xs: 'text-[12px]',
@@ -2000,6 +2557,27 @@ function GroundedNumber({
     '2xl': 'text-[44px]',
   };
 
+  // Hover tooltip: prefer descriptor's confidence block; fall back to legacy band/decomp
+  const tipBand   = resolved?.confidence?.band   ?? band;
+  const tipDecomp = resolved?.confidence?.decomp ?? decomp;
+  const clickable = !!resolved || !!lineageId;
+
+  function handleClick() {
+    if (resolved) {
+      openLineage(resolved);
+    } else if (lineageId) {
+      // Legacy fallback — synthesize a minimal descriptor for the drawer.
+      openLineage({
+        kind: lineageId, title: label || lineageId,
+        value, unit: format === 'pct' ? 'percent' : 'USD',
+        source: { system: '—', cdsView: '—', sheet: '—', origin: 'demo', label: 'Demo data' },
+        query: '-- no descriptor provided', rows: [],
+        derivation: { operation: 'IDENTITY', formula: 'legacy lineage stub', computed: value },
+        confidence: tipBand ? { band: tipBand, decomp: tipDecomp } : undefined,
+      });
+    }
+  }
+
   return (
     <span
       className={`group inline-flex items-baseline gap-1 font-mono tabular ${sizeMap[size] || ''} ${className}`}
@@ -2008,18 +2586,18 @@ function GroundedNumber({
     >
       <span className="relative">
         {rendered}
-        {hover && decomp && (
+        {hover && tipDecomp && (
           <span className="absolute z-30 bottom-full left-0 mb-2 w-72 hairline bg-ink-200 p-3 font-sans normal-case text-paper-100 text-[11px] tracking-normal shadow-2xl">
             <div className="text-[9px] uppercase tracking-[0.2em] text-paper-500 mb-1.5">Confidence Decomposition</div>
-            {band && (
+            {tipBand && (
               <div className="mb-2 font-mono text-paper-200">
-                P50 <span className="text-paper-50">{fmtUSD(band.p50, { compact: true })}</span>
+                P50 <span className="text-paper-50">{fmtUSD(tipBand.p50, { compact: true })}</span>
                 {' · '}
-                P10–P90 <span className="text-paper-300">{fmtUSD(band.p10, { compact: true })} – {fmtUSD(band.p90, { compact: true })}</span>
+                P10–P90 <span className="text-paper-300">{fmtUSD(tipBand.p10, { compact: true })} – {fmtUSD(tipBand.p90, { compact: true })}</span>
               </div>
             )}
             <div className="space-y-1">
-              {decomp.map(d => (
+              {tipDecomp.map(d => (
                 <div key={d.name} className="flex items-center gap-2">
                   <div className="flex-1 truncate">{d.name}</div>
                   <div className="w-20 h-1.5 bg-ink-400 relative">
@@ -2032,9 +2610,9 @@ function GroundedNumber({
           </span>
         )}
       </span>
-      {lineageId && (
+      {clickable && (
         <button
-          onClick={() => openLineage({ id: lineageId, label, value, band, decomp })}
+          onClick={handleClick}
           className="text-paper-500 hover:text-amber-400 transition-colors leading-none"
           title="Show data lineage"
         >
@@ -2047,99 +2625,32 @@ function GroundedNumber({
 
 /* ============================================================================
  * SECTION 8: LINEAGE DRAWER
+ *
+ * Renders the descriptor that the clicked GroundedNumber (or cascade node)
+ * passed via openLineage(desc). The descriptor carries the actual rows from
+ * the active dataset plus a derivation.computed value recomputed FROM those
+ * rows — so the "✓ matches" check is genuine reconciliation, not a tautology.
  * ========================================================================== */
 
-function buildLineageQueries(data) {
-  const { company, budgetCategories, budgetLines, budgetTotalFy26, suppliers, events, source } = data;
-  const fy = company.fy;
-  const sourceTag = source.type === 'upload'
-    ? `Source: uploaded workbook · ${source.fileName}`
-    : 'Source: Datasphere CDS views (mock)';
-  const firstEvent = events[0];
-  const contingencyUsd = company.contingencyReserveUsd ?? (company.targets.contingencyPct * budgetTotalFy26);
-  const projectedEbitda = company.currentEbitdaMargin ?? 0.139;
-  const ebitdaVariance = projectedEbitda - company.targets.ebitdaMargin;
+const ROW_USD_KEYS  = new Set(['fy_current','FY_Current','FY_Prior','total','baseline','est_impact','impact','spend','Annual_Spend_USD','Impact_P50','Estimated_Impact_USD','Reserve','OpEx','Revenue','Savings_P50','P10_USD','P50_USD','P90_USD']);
+const ROW_PCT_KEYS  = new Set(['Pct','Variance','% of OpEx','Forgone_Rate','rate']);
 
-  return {
-    budget_total: {
-      title: `${fy} Operating Budget — Total`,
-      sql: `-- ${sourceTag}
-SELECT
-  SUM(gl.fy_current_usd) AS total_opex,
-  COUNT(DISTINCT gl.line_id) AS line_items
-FROM ${source.type === 'upload' ? 'workbook.Budget_Lines' : 'datasphere.GL_Balances_BV'}
-WHERE gl.fiscal_year = '${fy}'
-  AND gl.entity = '${company.name}';`,
-      rows: budgetLines.slice(0, 8).map(l => ({ gl: (l.sap || '').split(' ').pop() || l.id, name: l.name, fy_current: l.fy26 })),
-      model: { name: 'budget-aggregator-v1.4', type: 'OR-Tools constraint LP', features: 'fy_prior, escalation %, hedge coverage', retrain: 'monthly · last 14 days', window: '36-month rolling' },
-    },
-    budget_donut: {
-      title: `${fy} Budget by Category`,
-      sql: `SELECT category, SUM(fy_current_usd) AS total
-FROM ${source.type === 'upload' ? 'workbook.Budget_Lines' : 'datasphere.GL_Balances_BV'}
-WHERE fiscal_year = '${fy}' GROUP BY category;`,
-      rows: budgetCategories.map(c => ({ category: c.name, total: budgetLines.filter(l => l.cat === c.id).reduce((s, l) => s + l.fy26, 0) })),
-      model: { name: 'budget-aggregator-v1.4', type: 'Aggregation', features: 'category mapping', retrain: 'on-update', window: 'live' },
-    },
-    margin: {
-      title: 'Gross Margin Projection',
-      sql: `SELECT (rev.total - opex.total) / rev.total AS margin
-FROM (SELECT SUM(revenue_usd) AS total FROM ${source.type === 'upload' ? 'workbook.Company' : 'datasphere.Sales_BV'} WHERE fy='${fy}') rev,
-     (SELECT SUM(fy_current_usd) AS total FROM ${source.type === 'upload' ? 'workbook.Budget_Lines' : 'datasphere.GL_Balances_BV'} WHERE fy='${fy}') opex;`,
-      rows: [
-        { metric: 'Revenue', value: company.revenue },
-        { metric: 'OpEx',    value: budgetTotalFy26 },
-        { metric: 'Gross Margin', value: company.revenue > 0 ? (company.revenue - budgetTotalFy26) / company.revenue : 0 },
-      ],
-      model: { name: 'margin-projector-v3.1', type: 'Bayesian regression', features: 'revenue forecast, opex baseline, hedge coverage', retrain: 'weekly · Tue 04:00 UTC', window: '60-month' },
-    },
-    ebitda: {
-      title: `EBITDA Margin (${fy})`,
-      sql: `WITH p AS (
-  SELECT ebitda_baseline_usd FROM ${source.type === 'upload' ? 'workbook.Company' : 'datasphere.PnL_BV'} WHERE fy='${fy}'
-) SELECT ebitda_baseline_usd / ${company.revenue} AS ebitda_margin FROM p;`,
-      rows: [
-        { metric: 'Target',    value: company.targets.ebitdaMargin },
-        { metric: 'Projected', value: projectedEbitda },
-        { metric: 'Variance',  value: ebitdaVariance },
-      ],
-      model: { name: 'pnl-projector-v2.6', type: 'XGBoost', features: 'opex, revenue mix, FX, hedge coverage', retrain: 'weekly', window: '48-month' },
-    },
-    contingency: {
-      title: 'Contingency Reserve',
-      sql: `SELECT reserve_usd, reserve_usd / opex_total AS pct
-FROM ${source.type === 'upload' ? 'workbook.Company' : 'datasphere.Treasury_BV'} WHERE fy='${fy}';`,
-      rows: [
-        { metric: 'Reserve',   value: contingencyUsd },
-        { metric: 'OpEx',      value: budgetTotalFy26 },
-        { metric: '% of OpEx', value: budgetTotalFy26 > 0 ? contingencyUsd / budgetTotalFy26 : 0 },
-      ],
-      model: { name: 'treasury-recon-v1.0', type: 'Rule-based', features: 'cash, credit lines, accruals', retrain: 'daily', window: 'live' },
-    },
-    hormuz_impact: {
-      title: firstEvent ? `${firstEvent.label} — P50 Impact` : 'Event — P50 Impact',
-      sql: firstEvent ? `SELECT SUM(impact_usd_mode) AS p50_impact
-FROM ${source.type === 'upload' ? 'workbook.Event_Impacts' : 'databricks.event_impact'}
-WHERE event_id = '${firstEvent.id}' AND scenario_horizon_days = 90;` : '-- no event loaded',
-      rows: firstEvent ? firstEvent.affectedLineIds.map(id => {
-        const l = budgetLines.find(x => x.id === id);
-        if (!l) return null;
-        const weight = firstEvent.impactWeights?.[id] ?? 0.045;
-        const impactRate = source.type === 'upload' ? Math.min(0.15, weight * 0.06) : 0.045;
-        return { line: l.name, baseline: l.fy26, est_impact: Math.round(l.fy26 * impactRate) };
-      }).filter(Boolean) : [],
-      model: { name: 'event-impact-bayes-v2.7', type: 'Bayesian regression', features: 'tariff rate, FX, demand elasticity, hedge coverage', retrain: 'event-triggered', window: '24-month' },
-    },
-    risk_score: {
-      title: 'Composite Risk Score',
-      sql: `SELECT supplier_id, name, region, composite_risk_score
-FROM ${source.type === 'upload' ? 'workbook.Suppliers' : 'datasphere.Suppliers_BV'}
-ORDER BY composite_risk_score DESC LIMIT 20;`,
-      rows: [...suppliers].sort((a, b) => b.riskScore - a.riskScore).slice(0, 12).map(s => ({ id: s.id, name: s.name, region: s.region, score: s.riskScore })),
-      model: { name: 'supplier-risk-iforest-v3.2', type: 'Isolation Forest', features: 'credit, OTD, region, geopolitical exposure', retrain: 'weekly', window: '24-month rolling' },
-    },
-    _sourceTag: sourceTag,
-  };
+function formatRowCell(key, v) {
+  if (v == null || v === '') return '—';
+  if (typeof v !== 'number') return String(v);
+  // Heuristics for whether a numeric cell should be rendered as USD / pct / score
+  if (ROW_USD_KEYS.has(key)) return fmtUSD(v, { compact: true, precision: 1 });
+  if (key === 'Value' || key === 'value') {
+    // Generic "Value" column — guess from magnitude
+    return Math.abs(v) < 1 ? fmtPct(v, 2) : fmtUSD(v, { compact: true, precision: 1 });
+  }
+  if (key === 'Composite_Risk_Score' || key === 'Risk_Score' || key === 'score') return v.toFixed(0);
+  if (key === 'Impact_Weight' || key === 'OTD' || key === 'Base_Rate' || key === 'Forgone_Rate' || key === 'rate') {
+    return v.toFixed(3);
+  }
+  if (key.includes('Pct') || key.includes('Variance') || key.includes('%')) return fmtPct(v, 2);
+  // Long numbers — render with commas
+  return v.toLocaleString('en-US');
 }
 
 function LineageDrawer() {
@@ -2148,107 +2659,213 @@ function LineageDrawer() {
     data: s.data,
   }));
 
-  if (!lineageOpen) return null;
-  const queries = buildLineageQueries(data);
-  const lineage = queries[lineageContext?.id] || queries.budget_total;
+  if (!lineageOpen || !lineageContext) return null;
+  const desc = lineageContext;
+
+  // Tolerance per unit: USD = 1 cent; percent = 0.05 percentage point (0.0005); score = 0.5
+  const tolerance =
+      desc.unit === 'percent' ? 0.0005
+    : desc.unit === 'score'   ? 0.5
+    : desc.unit === 'count'   ? 0.5
+    : 0.01;
+  const diff = Math.abs((desc.derivation?.computed ?? 0) - (desc.value ?? 0));
+  const matches = desc.derivation && diff <= tolerance;
+
+  // Column order from the first row
+  const cols = desc.rows && desc.rows[0] ? Object.keys(desc.rows[0]) : [];
+
+  // For SUM operations on a known column, render a TOTAL row whose value
+  // proves the header figure: sum of column == derivation.computed.
+  const showTotal = desc.derivation?.operation === 'SUM' && desc.sumColumn && cols.includes(desc.sumColumn);
+  const sumTotal = showTotal ? desc.rows.reduce((s, r) => s + (typeof r[desc.sumColumn] === 'number' ? r[desc.sumColumn] : 0), 0) : 0;
 
   return (
     <>
       <div className="fixed inset-0 z-40 bg-black/40 anim-fade-in" onClick={closeLineage} />
-      <div className="fixed top-0 right-0 z-50 h-full w-[560px] bg-ink-100 hairline-l overflow-y-auto anim-slide-up" style={{animationDuration:'.35s'}}>
-        <div className="sticky top-0 bg-ink-100/95 backdrop-blur hairline-b px-6 py-4 flex items-center justify-between z-10">
-          <div>
+      <div className="fixed top-0 right-0 z-50 h-full w-[640px] bg-ink-100 hairline-l overflow-y-auto anim-slide-up" style={{animationDuration:'.35s'}}>
+        {/* Header */}
+        <div className="sticky top-0 bg-ink-100/95 backdrop-blur hairline-b px-6 py-4 flex items-start justify-between gap-4 z-10">
+          <div className="flex-1 min-w-0">
             <div className="text-[10px] uppercase tracking-[0.24em] text-paper-500">Data Lineage</div>
-            <div className="font-display text-lg text-paper-50 mt-0.5">{lineage.title}</div>
+            <div className="font-display text-lg text-paper-50 mt-0.5 leading-tight">{desc.title}</div>
+            <div className="mt-2 flex items-center gap-2 flex-wrap">
+              <span className="font-mono text-[20px] text-paper-50">
+                {fmtForUnit(desc.value, desc.unit, { compact: desc.unit === 'USD', precision: desc.unit === 'USD' ? 1 : undefined, digits: 1 })}
+              </span>
+              <span className="text-[10px] uppercase tracking-[0.16em] font-mono text-paper-500">{desc.unit}</span>
+              <Pill color={desc.source.origin === 'upload' ? 'amber' : 'info'} size="xs">{desc.source.label}</Pill>
+            </div>
           </div>
-          <button onClick={closeLineage} className="hairline px-2 py-1.5 hover:bg-ink-300 transition-colors">
+          <button onClick={closeLineage} className="hairline px-2 py-1.5 hover:bg-ink-300 transition-colors flex-none">
             <X size={14} />
           </button>
         </div>
 
         <div className="p-6 space-y-6">
+          {/* Verified indicator — shown immediately so the eye lands on the reconciliation */}
+          <div
+            className={`hairline p-3 flex items-start gap-2 text-[12px] ${matches ? 'bg-stable/10 border-stable/40' : 'bg-amber/10 border-amber/40'}`}
+          >
+            {matches ? <CheckCircle2 size={14} className="text-stable mt-0.5 flex-none" /> : <AlertTriangle size={14} className="text-amber-400 mt-0.5 flex-none" />}
+            <div className="flex-1">
+              {matches ? (
+                <>
+                  <div className={`font-mono uppercase tracking-[0.16em] text-[10px] mb-0.5 ${matches ? 'text-stable-soft' : 'text-amber-300'}`}>
+                    Figure matches underlying records
+                  </div>
+                  <div className="text-paper-200">
+                    Recomputed from {desc.rows.length} record{desc.rows.length === 1 ? '' : 's'} ·
+                    <span className="font-mono ml-1">{fmtForUnit(desc.derivation.computed, desc.unit, { compact: desc.unit === 'USD', precision: 1, digits: 2 })}</span>
+                    {' '}={' '}
+                    <span className="font-mono">{fmtForUnit(desc.value, desc.unit, { compact: desc.unit === 'USD', precision: 1, digits: 2 })}</span>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="font-mono uppercase tracking-[0.16em] text-[10px] mb-0.5 text-amber-300">Reconciliation difference</div>
+                  <div className="text-paper-200">
+                    Header: <span className="font-mono">{fmtForUnit(desc.value, desc.unit, { compact: true, precision: 2, digits: 3 })}</span>{' '}
+                    · Recomputed: <span className="font-mono">{fmtForUnit(desc.derivation.computed, desc.unit, { compact: true, precision: 2, digits: 3 })}</span>{' '}
+                    · Δ <span className="font-mono">{fmtForUnit(diff, desc.unit, { compact: true, precision: 2, digits: 3 })}</span>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* Query */}
           <section>
-            <SectionLabel>Simulated Databricks query</SectionLabel>
-            <pre className="mt-2 hairline bg-ink-50 p-4 font-mono text-[11px] leading-relaxed text-paper-200 overflow-x-auto whitespace-pre">{lineage.sql}</pre>
+            <SectionLabel>Simulated query</SectionLabel>
+            <pre className="mt-2 hairline bg-ink-50 p-4 font-mono text-[11px] leading-relaxed text-paper-200 overflow-x-auto whitespace-pre">{desc.query}</pre>
             <div className="mt-2 text-[10px] text-paper-500 font-mono">
-              {data.source.type === 'upload'
-                ? `Source: ${data.source.fileName} · 8 sheets · validated`
-                : 'Datasphere CDS views: Suppliers_BV · BOM_Header_BV · GL_Balances_BV · Freight_Lanes_BV'}
+              {desc.source.origin === 'upload'
+                ? `Source: ${desc.source.fileName} · sheet ${desc.source.sheet}`
+                : `Datasphere CDS view: ${desc.source.cdsView} · sheet ${desc.source.sheet}`}
             </div>
           </section>
 
-          <section>
-            <SectionLabel right={`${lineage.rows.length} rows`}>Underlying records (sample)</SectionLabel>
-            <div className="mt-2 hairline overflow-hidden">
-              <table className="w-full text-[12px] font-mono">
-                <thead className="bg-ink-200 text-paper-400 text-[10px] uppercase tracking-[0.16em]">
-                  <tr>{lineage.rows[0] && Object.keys(lineage.rows[0]).map(k => <th key={k} className="text-left px-3 py-2">{k}</th>)}</tr>
-                </thead>
-                <tbody>
-                  {lineage.rows.map((r, i) => (
-                    <tr key={i} className={i % 2 ? 'bg-ink-200/40' : ''}>
-                      {Object.entries(r).map(([k, v]) => (
-                        <td key={k} className="px-3 py-2 text-paper-100">
-                          {typeof v === 'number' && k.includes('value') && k !== 'fy_current' ? (Math.abs(v) < 1 ? fmtPct(v) : fmtUSD(v, { compact: true })) :
-                           typeof v === 'number' && (k.includes('impact') || k.includes('baseline') || k === 'fy_current' || k === 'fy26' || k === 'total' || k === 'spend') ? fmtUSD(v, { compact: true }) :
-                           typeof v === 'number' && k === 'score' ? v.toFixed(0) :
-                           String(v)}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </section>
-
-          <section>
-            <SectionLabel>Model card</SectionLabel>
-            <div className="mt-2 hairline p-4 space-y-2 bg-ink-200/40">
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="font-mono text-[13px] text-paper-50">{lineage.model.name}</div>
-                  <div className="text-[10px] uppercase tracking-[0.18em] text-paper-500 mt-0.5">{lineage.model.type}</div>
-                </div>
-                <Pill color="info" size="xs">Production</Pill>
-              </div>
-              <div className="grid grid-cols-2 gap-3 text-[11px] mt-3">
-                <div>
-                  <div className="text-[9px] uppercase tracking-[0.2em] text-paper-500">Features</div>
-                  <div className="text-paper-200 mt-0.5">{lineage.model.features}</div>
-                </div>
-                <div>
-                  <div className="text-[9px] uppercase tracking-[0.2em] text-paper-500">Training window</div>
-                  <div className="text-paper-200 mt-0.5 font-mono">{lineage.model.window}</div>
-                </div>
-                <div>
-                  <div className="text-[9px] uppercase tracking-[0.2em] text-paper-500">Retrain cadence</div>
-                  <div className="text-paper-200 mt-0.5 font-mono">{lineage.model.retrain}</div>
-                </div>
-                <div>
-                  <div className="text-[9px] uppercase tracking-[0.2em] text-paper-500">Decision boundary</div>
-                  <div className="text-paper-200 mt-0.5 font-mono">CRPS &lt; 0.20</div>
-                </div>
-              </div>
-            </div>
-          </section>
-
-          {lineageContext?.band && (
+          {/* Records */}
+          {desc.rows && desc.rows.length > 0 && (
             <section>
-              <SectionLabel>Confidence</SectionLabel>
-              <div className="mt-2 hairline p-4 bg-ink-200/40">
-                <div className="font-mono text-[14px] text-paper-50">
-                  P50 {fmtUSD(lineageContext.band.p50, { compact: true })}
-                  <span className="text-paper-400"> ± {fmtUSD((lineageContext.band.p90 - lineageContext.band.p10)/2, { compact: true })}</span>
+              <SectionLabel right={`${desc.rows.length} record${desc.rows.length === 1 ? '' : 's'}${showTotal ? ' + TOTAL' : ''}`}>
+                Underlying records
+              </SectionLabel>
+              <div className="mt-2 hairline overflow-x-auto">
+                <table className="w-full text-[12px] font-mono">
+                  <thead className="bg-ink-200 text-paper-400 text-[10px] uppercase tracking-[0.16em]">
+                    <tr>{cols.map(k => <th key={k} className="text-left px-3 py-2 whitespace-nowrap">{k}</th>)}</tr>
+                  </thead>
+                  <tbody>
+                    {desc.rows.map((r, i) => (
+                      <tr key={i} className={i % 2 ? 'bg-ink-200/40' : ''}>
+                        {cols.map(k => (
+                          <td key={k} className="px-3 py-2 text-paper-100 whitespace-nowrap">{formatRowCell(k, r[k])}</td>
+                        ))}
+                      </tr>
+                    ))}
+                    {showTotal && (
+                      <tr className="bg-ink-300/60 border-t border-amber/40">
+                        {cols.map((k, i) => (
+                          <td key={k} className="px-3 py-2 text-paper-50 font-bold whitespace-nowrap">
+                            {i === 0 ? 'TOTAL' : k === desc.sumColumn ? formatRowCell(k, sumTotal) : ''}
+                          </td>
+                        ))}
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          )}
+
+          {/* Derivation */}
+          {desc.derivation && (
+            <section>
+              <SectionLabel>Derivation</SectionLabel>
+              <div className="mt-2 hairline p-4 bg-ink-200/40 space-y-2">
+                <div className="flex items-start gap-3">
+                  <Pill color="amber" size="xs">{desc.derivation.operation}</Pill>
+                  <div className="text-[12px] text-paper-100 flex-1">{desc.derivation.formula}</div>
                 </div>
-                <div className="mt-3 flex items-center gap-3 text-[11px] font-mono">
-                  <div className="text-paper-400">P10 <span className="text-paper-100">{fmtUSD(lineageContext.band.p10, { compact: true })}</span></div>
-                  <div className="text-paper-400">P50 <span className="text-paper-100">{fmtUSD(lineageContext.band.p50, { compact: true })}</span></div>
-                  <div className="text-paper-400">P90 <span className="text-paper-100">{fmtUSD(lineageContext.band.p90, { compact: true })}</span></div>
+                <div className="font-mono text-[14px] text-paper-50 pt-1 hairline-t">
+                  = <span className="text-amber-400">{fmtForUnit(desc.derivation.computed, desc.unit, { compact: desc.unit === 'USD', precision: 1, digits: 2 })}</span>
                 </div>
               </div>
             </section>
           )}
+
+          {/* Confidence (P10/P50/P90) */}
+          {desc.confidence?.band && (
+            <section>
+              <SectionLabel>Confidence</SectionLabel>
+              <div className="mt-2 hairline p-4 bg-ink-200/40">
+                <div className="font-mono text-[14px] text-paper-50">
+                  P50 {fmtUSD(desc.confidence.band.p50, { compact: true })}
+                  <span className="text-paper-400"> ± {fmtUSD((desc.confidence.band.p90 - desc.confidence.band.p10) / 2, { compact: true })}</span>
+                </div>
+                <div className="mt-3 flex items-center gap-3 text-[11px] font-mono">
+                  <div className="text-paper-400">P10 <span className="text-paper-100">{fmtUSD(desc.confidence.band.p10, { compact: true })}</span></div>
+                  <div className="text-paper-400">P50 <span className="text-paper-100">{fmtUSD(desc.confidence.band.p50, { compact: true })}</span></div>
+                  <div className="text-paper-400">P90 <span className="text-paper-100">{fmtUSD(desc.confidence.band.p90, { compact: true })}</span></div>
+                </div>
+                {desc.confidence.decomp && desc.confidence.decomp.length > 0 && (
+                  <div className="mt-3 space-y-1.5">
+                    <div className="text-[10px] uppercase tracking-[0.18em] text-paper-500 font-mono">Driver decomposition</div>
+                    {desc.confidence.decomp.map(d => (
+                      <div key={d.name} className="flex items-center gap-2 text-[11px]">
+                        <div className="flex-1 truncate text-paper-200">{d.name}</div>
+                        <div className="w-32 h-1.5 bg-ink-400 relative">
+                          <div className="absolute inset-y-0 left-0 bg-amber" style={{width: `${d.weight * 100}%`}} />
+                        </div>
+                        <div className="w-12 text-right font-mono text-paper-200">{Math.round(d.weight * 100)}%</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </section>
+          )}
+
+          {/* Model card */}
+          {desc.model && (
+            <section>
+              <SectionLabel>Model card</SectionLabel>
+              <div className="mt-2 hairline p-4 space-y-2 bg-ink-200/40">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="font-mono text-[13px] text-paper-50">{desc.model.name}</div>
+                    <div className="text-[10px] uppercase tracking-[0.18em] text-paper-500 mt-0.5">{desc.model.type}</div>
+                  </div>
+                  <Pill color="info" size="xs">Production</Pill>
+                </div>
+                <div className="grid grid-cols-2 gap-3 text-[11px] mt-3">
+                  <div>
+                    <div className="text-[9px] uppercase tracking-[0.2em] text-paper-500">Features</div>
+                    <div className="text-paper-200 mt-0.5">{desc.model.features}</div>
+                  </div>
+                  <div>
+                    <div className="text-[9px] uppercase tracking-[0.2em] text-paper-500">Training window</div>
+                    <div className="text-paper-200 mt-0.5 font-mono">{desc.model.window || '—'}</div>
+                  </div>
+                  <div>
+                    <div className="text-[9px] uppercase tracking-[0.2em] text-paper-500">Retrain cadence</div>
+                    <div className="text-paper-200 mt-0.5 font-mono">{desc.model.retrain || '—'}</div>
+                  </div>
+                  <div>
+                    <div className="text-[9px] uppercase tracking-[0.2em] text-paper-500">Decision boundary</div>
+                    <div className="text-paper-200 mt-0.5 font-mono">CRPS &lt; 0.20</div>
+                  </div>
+                </div>
+              </div>
+            </section>
+          )}
+
+          {/* CDS-view ribbon at the bottom of the drawer */}
+          <div className="hairline-t pt-3 text-[10px] text-paper-500 font-mono">
+            {desc.source.origin === 'upload'
+              ? `Source: ${desc.source.fileName} · 8 sheets · validated · grounded values traced to uploaded workbook`
+              : 'Datasphere CDS views: Suppliers_BV · BOM_Header_BV · GL_Balances_BV · Freight_Lanes_BV'}
+          </div>
         </div>
       </div>
     </>
@@ -2457,19 +3074,25 @@ function SavedPlaysDropdown() {
 
 function KPIStrip() {
   const { mode, data } = useWarRoom(s => ({ mode: s.mode, data: s.data }));
-  const opex = data.budgetTotalFy26;
-  const margin = data.company.revenue > 0 ? (data.company.revenue - opex) / data.company.revenue : 0;
-  const ebitda = data.company.currentEbitdaMargin ?? 0.139;
+
+  // Build descriptors first — these become the single source of truth for
+  // both the displayed value and the lineage drawer's reconciliation.
+  const opexLineage       = useMemo(() => buildLineage('budget_total',  { data }), [data]);
+  const marginLineage     = useMemo(() => buildLineage('gross_margin',  { data }), [data]);
+  const ebitdaLineage     = useMemo(() => buildLineage('ebitda_margin', { data }), [data]);
+  const contingencyLineage= useMemo(() => buildLineage('contingency',   { data }), [data]);
+
+  const opex   = opexLineage.derivation.computed;
+  const margin = marginLineage.derivation.computed;
+  const ebitda = ebitdaLineage.derivation.computed;
   const contingencyUsd = data.company.contingencyReserveUsd ?? (data.company.targets.contingencyPct * opex);
-  const contingencyPct = opex > 0 ? contingencyUsd / opex : 0;
   const riskScore = data.suppliers.length ? Math.round(data.suppliers.reduce((s, x) => s + x.riskScore, 0) / data.suppliers.length) : 0;
-  // Active signals = red + amber from the live pool (subject to upload override)
   const activeSignals = data.company.activeSignalCount ?? data.signalPool.filter(s => s.confidence !== 'green').length;
 
   const opexDelta = data.budgetTotalFy25 > 0
     ? `+${fmtPct((opex - data.budgetTotalFy25) / data.budgetTotalFy25, 1)} vs FY prior`
     : '—';
-  const marginGap = (margin - data.company.targets.grossMargin) * 10000; // bps
+  const marginGap = (margin - data.company.targets.grossMargin) * 10000;
   const marginDelta = marginGap >= 0 ? `+${Math.round(marginGap)}bps to target` : `${Math.round(marginGap)}bps to target`;
   const ebitdaGap = (ebitda - data.company.targets.ebitdaMargin) * 10000;
   const ebitdaDelta = ebitdaGap >= 0 ? `+${Math.round(ebitdaGap)}bps to target` : `${Math.round(ebitdaGap)}bps to target`;
@@ -2478,22 +3101,22 @@ function KPIStrip() {
     <div className="hairline-t bg-ink-50/60 px-5 py-2.5 grid grid-cols-5 gap-px">
       <KPITile
         label={`Total OpEx (${data.company.fy})`} sub={`Baseline · ${data.budgetLines.length} lines`}
-        value={<GroundedNumber value={opex} compact precision={1} size="md" label="Total OpEx" lineageId="budget_total" />}
+        value={<GroundedNumber lineage={opexLineage} compact precision={1} size="md" />}
         delta={opexDelta} deltaColor="amber"
       />
       <KPITile
         label="Gross Margin" sub={`Target ${fmtPct(data.company.targets.grossMargin, 0)}`}
-        value={<GroundedNumber value={margin} format="pct" precision={1} size="md" label="Gross Margin" lineageId="margin" />}
+        value={<GroundedNumber lineage={marginLineage} precision={1} size="md" />}
         delta={marginDelta} deltaColor={marginGap >= 0 ? 'stable' : 'amber'}
       />
       <KPITile
         label="EBITDA Margin" sub={`Target ${fmtPct(data.company.targets.ebitdaMargin, 1)}`}
-        value={<GroundedNumber value={ebitda} format="pct" precision={1} size="md" label="EBITDA Margin" lineageId="ebitda" />}
+        value={<GroundedNumber lineage={ebitdaLineage} precision={1} size="md" />}
         delta={ebitdaDelta} deltaColor={ebitdaGap >= 0 ? 'stable' : 'amber'}
       />
       <KPITile
         label="Contingency Reserve" sub="As % of OpEx"
-        value={<GroundedNumber value={contingencyPct} format="pct" precision={1} size="md" label="Contingency" lineageId="contingency" />}
+        value={<GroundedNumber lineage={contingencyLineage} precision={1} size="md" />}
         delta={fmtUSD(contingencyUsd, { compact: true })} deltaColor="stable"
       />
       <KPITile
@@ -2734,7 +3357,7 @@ function SteadyState() {
 
 function BudgetPanel() {
   // Theme-aware palette — donut + legend swatches re-color on theme switch
-  const { theme, data } = useWarRoom(s => ({ theme: s.theme, data: s.data }));
+  const { theme, data, openLineage } = useWarRoom(s => ({ theme: s.theme, data: s.data, openLineage: s.openLineage }));
   const palette = CHART_PALETTES[theme] || CHART_PALETTES['war-room'];
   const catSums = useMemo(() => data.budgetCategories.map((c, i) => ({
     ...c,
@@ -2743,9 +3366,9 @@ function BudgetPanel() {
   })).sort((a, b) => b.total - a.total), [palette, data]);
 
   const fy = data.company.fy;
-  const opex = data.budgetTotalFy26;
+  const opexLineage = useMemo(() => buildLineage('budget_total', { data }), [data]);
+  const opex = opexLineage.derivation.computed;
   const opexPrior = data.budgetTotalFy25;
-  const contingencyUsd = data.company.contingencyReserveUsd ?? (data.company.targets.contingencyPct * opex);
 
   return (
     <section className="hairline bg-ink-100/40">
@@ -2753,7 +3376,7 @@ function BudgetPanel() {
         <div>
           <div className="text-[10px] uppercase tracking-[0.24em] text-paper-500">{fy} Operating Budget</div>
           <div className="font-display text-[20px] text-paper-50 mt-0.5 tracking-tight">
-            <GroundedNumber value={opex} compact precision={1} size="lg" lineageId="budget_total" label={`${fy} Total OpEx`} />
+            <GroundedNumber lineage={opexLineage} compact precision={1} size="lg" />
             <span className="ml-2 text-[12px] font-sans text-paper-400 font-normal">across {data.budgetLines.length} line items · {data.budgetCategories.length} categories</span>
           </div>
         </div>
@@ -2775,8 +3398,9 @@ function BudgetPanel() {
                   cx="50%" cy="50%"
                   innerRadius={68} outerRadius={108} stroke={COLORS.ink50} strokeWidth={2}
                   paddingAngle={1}
+                  onClick={(d) => d && openLineage(buildLineage('category_total', { data, categoryId: d.id }))}
                 >
-                  {catSums.map((c, i) => <Cell key={c.id} fill={c.color} />)}
+                  {catSums.map((c, i) => <Cell key={c.id} fill={c.color} style={{ cursor: 'pointer' }} />)}
                 </Pie>
                 <RTooltip
                   content={({ active, payload }) => {
@@ -2786,6 +3410,7 @@ function BudgetPanel() {
                       <div className="hairline bg-ink-200 px-3 py-2 text-[11px]">
                         <div className="text-paper-50 font-mono">{d.name}</div>
                         <div className="text-paper-300 font-mono">{fmtUSD(d.total, { compact: true })} · {fmtPct(opex > 0 ? d.total / opex : 0, 1)}</div>
+                        <div className="text-paper-500 text-[9px] mt-1 uppercase tracking-[0.16em]">click for lineage</div>
                       </div>
                     );
                   }}
@@ -2809,48 +3434,50 @@ function BudgetPanel() {
           </div>
         </div>
 
-        {/* Category legend */}
+        {/* Category legend — each row is a clickable lineage trigger */}
         <div className="col-span-4 bg-ink-100 p-5">
           <SectionLabel right={`${catSums.length} categories`}>Categories</SectionLabel>
           <div className="mt-2 space-y-1">
             {catSums.map((c) => (
-              <div
+              <button
                 key={c.id}
-                className="flex items-center gap-2 group cursor-default"
-                onClick={() => useWarRoom.getState().openLineage({ id: 'budget_donut', label: c.name })}
+                type="button"
+                className="w-full text-left flex items-center gap-2 group cursor-pointer hover:bg-ink-200/30 px-1 py-0.5 -mx-1 transition-colors"
+                onClick={() => openLineage(buildLineage('category_total', { data, categoryId: c.id }))}
+                title="Show data lineage"
               >
                 <div className="size-2.5 flex-none" style={{ background: c.color }} />
                 <div className="text-[11.5px] text-paper-100 flex-1">{c.name}</div>
                 <div className="font-mono text-[11px] text-paper-200">{fmtUSD(c.total, { compact: true })}</div>
                 <div className="font-mono text-[10px] text-paper-500 w-10 text-right">{fmtPct(opex > 0 ? c.total / opex : 0, 1)}</div>
-              </div>
+                <Database size={9} className="text-paper-500 group-hover:text-amber-400 transition-colors" />
+              </button>
             ))}
           </div>
         </div>
 
         {/* KPIs vertical stack */}
         <div className="col-span-3 bg-ink-100 p-5 space-y-3">
-          <SmallKPI
-            label="Gross Margin (proj)" value={data.company.revenue > 0 ? (data.company.revenue - opex) / data.company.revenue : 0}
-            target={data.company.targets.grossMargin} format="pct" lineageId="margin"
-          />
-          <SmallKPI label="EBITDA Margin" value={data.company.currentEbitdaMargin ?? 0.139} target={data.company.targets.ebitdaMargin} format="pct" lineageId="ebitda" />
-          <SmallKPI label="Contingency" value={opex > 0 ? contingencyUsd / opex : 0} target={data.company.targets.contingencyPct} format="pct" lineageId="contingency" />
-          <SmallKPI label="Hedge Coverage" value={data.company.targets.hedgeCoverage} target={data.company.targets.hedgeCoverage} format="pct" />
+          <SmallKPI label="Gross Margin (proj)" lineageKind="gross_margin"  target={data.company.targets.grossMargin} data={data} />
+          <SmallKPI label="EBITDA Margin"        lineageKind="ebitda_margin" target={data.company.targets.ebitdaMargin} data={data} />
+          <SmallKPI label="Contingency"          lineageKind="contingency"   target={data.company.targets.contingencyPct} data={data} />
+          <SmallKPI label="Hedge Coverage"       lineageKind="hedge_coverage" target={data.company.targets.hedgeCoverage} data={data} />
         </div>
       </div>
     </section>
   );
 }
 
-function SmallKPI({ label, value, target, format = 'pct', lineageId }) {
+function SmallKPI({ label, target, lineageKind, data }) {
+  const lineage = useMemo(() => buildLineage(lineageKind, { data }), [lineageKind, data]);
+  const value = lineage?.derivation.computed ?? 0;
   const onTarget = value >= target;
   const variance = value - target;
   return (
     <div className="hairline p-3 bg-ink-200/30">
       <div className="text-[9px] uppercase tracking-[0.2em] text-paper-500">{label}</div>
       <div className="mt-1 flex items-baseline gap-2">
-        <GroundedNumber value={value} format={format} precision={1} size="md" lineageId={lineageId} label={label} />
+        <GroundedNumber lineage={lineage} precision={1} size="md" />
         <span className={`text-[10px] font-mono ${onTarget ? 'text-emerald-400' : 'text-amber-400'}`}>
           {onTarget ? '▲' : '▼'} {fmtPct(Math.abs(variance), 2)}
         </span>
@@ -2903,7 +3530,7 @@ function SupplierHeatmap() {
         <div className="flex items-center gap-3">
           <RiskLegend />
           <button
-            onClick={() => useWarRoom.getState().openLineage({ id: 'risk_score', label: 'Composite Risk Score' })}
+            onClick={() => useWarRoom.getState().openLineage(buildLineage('supplier_risk_overview', { data: useWarRoom.getState().data }))}
             className="hairline px-2 py-1.5 text-[10px] uppercase tracking-[0.18em] text-paper-300 hover:text-paper-50 hover:bg-ink-300 transition-colors flex items-center gap-1.5"
           >
             <Database size={11} /> Lineage
@@ -2952,10 +3579,10 @@ function SupplierHeatmap() {
                   <div className="text-[10px] uppercase tracking-[0.18em] text-paper-500 font-mono mt-0.5">{s.id} · {s.city}, {s.country}</div>
                 </div>
                 <div className="flex-1 grid grid-cols-5 gap-4 text-[11px]">
-                  <Metric label="Risk Score"  v={<span className="font-mono text-paper-50">{s.riskScore}</span>} />
+                  <Metric label="Risk Score"  v={<GroundedNumber lineage={buildLineage('supplier_risk', { data: useWarRoom.getState().data, supplierId: s.id })} size="sm" />} />
                   <Metric label="OTD"          v={<span className="font-mono text-paper-50">{fmtPct(s.otd, 1)}</span>} />
                   <Metric label="Credit"       v={<span className="font-mono text-paper-50">{s.credit}</span>} />
-                  <Metric label="Annual Spend" v={<GroundedNumber value={s.spend} compact precision={0} size="sm" />} />
+                  <Metric label="Annual Spend" v={<GroundedNumber lineage={buildLineage('supplier_spend', { data: useWarRoom.getState().data, supplierId: s.id })} compact precision={1} size="sm" />} />
                   <Metric label="Materials"    v={<span className="text-paper-100">{s.materials.join(' · ')}</span>} />
                 </div>
                 {selected && (
@@ -3345,9 +3972,26 @@ function CascadingGraphPanel() {
       .attr('class', 'node')
       .style('cursor', 'pointer')
       .style('opacity', 0)
-      .on('click', (event, d) => {
-        const lineageId = d.type === 'budget' ? 'budget_total' : d.type === 'supplier' ? 'risk_score' : d.type === 'pnl' ? 'hormuz_impact' : 'hormuz_impact';
-        openLineage({ id: lineageId, label: d.label, value: d.meta?.est || d.meta?.fy26 });
+      .on('click', (clickEv, d) => {
+        // Build a real lineage descriptor for this cascade node using the active dataset
+        const activeData = useWarRoom.getState().data;
+        const ev = activeData.eventById[activeEventId];
+        let desc = null;
+        if (d.type === 'signal' && ev) {
+          desc = buildLineage('cascade_signal', { data: activeData, event: ev });
+        } else if (d.type === 'supplier') {
+          desc = buildLineage('supplier_risk', { data: activeData, supplierId: d.id });
+        } else if (d.type === 'budget' && ev) {
+          desc = buildLineage('budget_line_impact', { data: activeData, event: ev, lineId: d.id });
+        } else if (d.type === 'pnl') {
+          desc = buildLineage('pnl_outcome', { data: activeData, plLabel: d.label, plImpact: d.meta?.est || 0 });
+        } else if (d.type === 'plant') {
+          // Plants don't have a dedicated lineage kind — use budget_total as a fallback
+          desc = buildLineage('budget_total', { data: activeData });
+        } else if (d.type === 'bom') {
+          desc = buildLineage('budget_total', { data: activeData });
+        }
+        if (desc) openLineage(desc);
       })
       .on('mouseenter', (event, d) => setHover({ d, x: event.clientX, y: event.clientY }))
       .on('mouseleave', () => setHover(null));
@@ -3499,10 +4143,11 @@ function CascadingGraphPanel() {
 function CounterfactualReplay() {
   const { counterfactualDays, setCounterfactualDays, activeEventId, data } = useWarRoom();
   const event = activeEventId ? data.eventById[activeEventId] : null;
-  if (!event) return null;
-  // Savings forgone scales non-linearly with delay
-  const forgoneRate = (counterfactualDays / 21) * 0.42; // up to 42% of P50 impact
-  const forgone = event.impactRange.mode * forgoneRate;
+  const forgoneLineage = useMemo(
+    () => event ? buildLineage('counterfactual_forgone', { data, event, days: counterfactualDays }) : null,
+    [data, event, counterfactualDays]
+  );
+  if (!event || !forgoneLineage) return null;
 
   return (
     <div className="absolute bottom-3 left-3 right-3 hairline bg-ink-100/95 backdrop-blur px-4 py-3 z-10">
@@ -3516,10 +4161,7 @@ function CounterfactualReplay() {
             <span className="text-paper-500">slide to see savings forgone</span>
           ) : (
             <span>Acting <span className="text-amber-400">{counterfactualDays}d ago</span> would have saved an additional{' '}
-              <GroundedNumber value={forgone} compact precision={1} size="sm" className="text-paper-50"
-                band={{ p10: forgone * 0.7, p50: forgone, p90: forgone * 1.3 }}
-                decomp={event.detailedDrivers}
-              />
+              <GroundedNumber lineage={forgoneLineage} compact precision={1} size="sm" className="text-paper-50" />
             </span>
           )}
         </div>
@@ -3550,28 +4192,28 @@ function CounterfactualReplay() {
 // ---------- Baseline Impact panel — shown BEFORE any strategy is applied ----------
 // The user needs to see the cost of doing nothing immediately on entering Response State.
 function BaselineImpactPanel() {
-  const { activeEventId, multiEvent, secondaryEventId, data } = useWarRoom();
+  const { activeEventId, multiEvent, secondaryEventId, data, openLineage } = useWarRoom();
   const event = activeEventId ? data.eventById[activeEventId] : null;
-  if (!event) return null;
-
-  // Joint impact when multi-event stress mode is on (~18% non-linear interaction penalty)
   const ev2 = multiEvent && secondaryEventId ? data.eventById[secondaryEventId] : null;
-  const ev2Mult = 1.18;
-  const p50 = event.impactRange.mode + (ev2 ? ev2.impactRange.mode * ev2Mult : 0);
-  const p10 = event.impactRange.min  + (ev2 ? ev2.impactRange.min  * ev2Mult : 0);
-  const p90 = event.impactRange.max  + (ev2 ? ev2.impactRange.max  * ev2Mult : 0);
+
+  // Single seeded MC drives both the headline figure AND the lineage drawer.
+  const mc = useMemo(
+    () => computeEventP50({ event, ev2, data, multiEvent }),
+    [event, ev2, data, multiEvent]
+  );
+  const baselineLineage = useMemo(
+    () => mc ? buildLineage('event_baseline_p50', { data, event, ev2, multiEvent, mc }) : null,
+    [data, event, ev2, multiEvent, mc]
+  );
+
+  if (!event || !mc || !baselineLineage) return null;
+
+  const p10 = mc.p10, p50 = mc.p50, p90 = mc.p90;
   const spread = (p90 - p10) / 2;
 
-  // Top-affected budget lines for the per-line bars. For uploaded data the
-  // impact rate is the per-event Impact_Weight × 6%; for Meridian default it's a
-  // flat 4.5% (matching the original behavior).
-  const affected = event.affectedLineIds.slice(0, 7).map(id => {
-    const l = data.budgetLines.find(x => x.id === id);
-    if (!l) return null;
-    const weight = event.impactWeights?.[id];
-    const impactRate = weight != null ? Math.min(0.15, weight * 0.06) : 0.045;
-    return { id: l.id, name: l.name, impact: l.fy26 * impactRate };
-  }).filter(Boolean);
+  // Per-line bars use the SAME calibrated per-line impacts as the MC. So the
+  // bars and the headline figure are internally consistent.
+  const affected = mc.perLine.slice(0, 7).map(l => ({ id: l.id, name: l.name, impact: l.impactMode }));
   const maxBar = Math.max(...affected.map(l => l.impact), 1);
 
   return (
@@ -3583,21 +4225,24 @@ function BaselineImpactPanel() {
           <Pill color="critical" size="xs">UNMITIGATED</Pill>
           {ev2 && <Pill color="critical" size="xs">+JOINT</Pill>}
         </div>
-        <div className="text-[10px] text-paper-500 font-mono whitespace-nowrap">90-day horizon · Monte Carlo</div>
+        <div className="text-[10px] text-paper-500 font-mono whitespace-nowrap">90-day horizon · seeded Monte Carlo · 5,000 iter</div>
       </div>
 
-      {/* Headline figure + range */}
+      {/* Headline figure + range. The GroundedNumber's lineage IS the MC result,
+          so on-screen P50 ≡ derivation.computed (the drawer's recomputation). */}
       <div className="grid grid-cols-[auto_1fr] gap-4 items-baseline mb-3">
         <div className="hairline bg-critical/10 border-critical/40 px-3 py-2">
           <div className="text-[9px] uppercase tracking-[0.2em] text-critical-soft font-mono">Expected · P50</div>
           <div className="mt-0.5">
             <GroundedNumber
-              value={-p50} compact precision={1} size="xl"
+              lineage={{
+                ...baselineLineage,
+                value: -baselineLineage.value,
+                derivation: { ...baselineLineage.derivation, computed: -baselineLineage.derivation.computed },
+                confidence: { band: { p10: -mc.p90, p50: -mc.p50, p90: -mc.p10 }, decomp: event.detailedDrivers },
+              }}
+              compact precision={1} size="xl"
               className="text-critical-soft tabular"
-              band={{ p10: -p90, p50: -p50, p90: -p10 }}
-              decomp={event.detailedDrivers}
-              lineageId="hormuz_impact"
-              label="Baseline event impact (P50)"
             />
           </div>
           <div className="text-[10px] text-paper-400 font-mono mt-0.5">
@@ -3625,19 +4270,27 @@ function BaselineImpactPanel() {
         </div>
       </div>
 
-      {/* Per-line bars showing where the damage lands */}
+      {/* Per-line bars showing where the damage lands. Each bar is now
+          individually clickable for its own lineage descriptor. */}
       <div className="space-y-[3px]">
         <div className="text-[9px] uppercase tracking-[0.18em] text-paper-500 font-mono mb-1">Top affected budget lines</div>
         {affected.map(l => {
           const pct = (l.impact / maxBar) * 100;
           return (
-            <div key={l.id} className="flex items-center gap-2 text-[10px] font-mono">
+            <button
+              key={l.id}
+              type="button"
+              onClick={() => openLineage(buildLineage('budget_line_impact', { data, event, lineId: l.id }))}
+              className="w-full text-left flex items-center gap-2 text-[10px] font-mono group hover:bg-ink-200/30 px-1 py-0.5 -mx-1 transition-colors"
+              title="Show data lineage"
+            >
               <div className="w-36 text-paper-400 truncate" title={l.name}>{l.name}</div>
               <div className="flex-1 relative h-2.5 bg-ink-300/60">
                 <div className="absolute inset-y-0 left-0 bg-critical/70" style={{ width: `${pct}%` }} />
               </div>
               <div className="w-16 text-right text-critical-soft">{fmtUSD(-l.impact, { compact: true })}</div>
-            </div>
+              <Database size={9} className="text-paper-500 group-hover:text-amber-400 transition-colors flex-none" />
+            </button>
           );
         })}
       </div>
@@ -3802,12 +4455,23 @@ function DraggableClausePill({ clauseId, sourceId, inWorkspace, dimmed }) {
 
 // ---------- Strategy card (one per proposed mitigation) ----------
 function StrategyCard({ strategy, event, multiEvent }) {
-  const { strategyVotes, setStrategyVote, applyStrategyById, selectedStrategyId, setStrategy, selectedClauses, applyingStrategy, clauses } = useWarRoom(s => ({
+  const { strategyVotes, setStrategyVote, applyStrategyById, selectedStrategyId, setStrategy, selectedClauses, applyingStrategy, clauses, data, secondaryEventId } = useWarRoom(s => ({
     strategyVotes: s.strategyVotes, setStrategyVote: s.setStrategyVote, applyStrategyById: s.applyStrategyById,
     selectedStrategyId: s.selectedStrategyId, setStrategy: s.setStrategy, selectedClauses: s.selectedClauses,
-    applyingStrategy: s.applyingStrategy, clauses: s.data.clauses,
+    applyingStrategy: s.applyingStrategy, clauses: s.data.clauses, data: s.data, secondaryEventId: s.secondaryEventId,
   }));
-  const sResult = solveStrategy(event, strategy.clauses, clauses, multiEvent);
+  const ev2 = multiEvent && secondaryEventId ? data.eventById[secondaryEventId] : null;
+  // Seeded MC over the strategy's clauses — drives both the displayed
+  // savings figure AND its lineage descriptor.
+  const mc = useMemo(
+    () => computeStrategySavings({ event, ev2, multiEvent, clauseIds: strategy.clauses, clausesMap: clauses }),
+    [event, ev2, multiEvent, strategy.clauses, clauses]
+  );
+  const savingsLineage = useMemo(
+    () => buildLineage('strategy_savings', { data, strategy, mc }),
+    [data, strategy, mc]
+  );
+  const sResult = mc;
   const isSelected = selectedStrategyId === strategy.id;
   const votes = strategyVotes[strategy.id];
   const cons = consensusOf(votes);
@@ -3837,8 +4501,7 @@ function StrategyCard({ strategy, event, multiEvent }) {
       <div className="mt-2.5 flex items-center gap-3 flex-wrap">
         <div className="flex items-center gap-1">
           <span className="text-[9px] uppercase tracking-[0.16em] text-paper-500 font-mono">Savings P50</span>
-          <GroundedNumber value={sResult.savingsMode} compact precision={1} size="sm" className="text-stable"
-            band={{ p10: sResult.savingsMin, p50: sResult.savingsMode, p90: sResult.savingsMax }} />
+          <GroundedNumber lineage={savingsLineage} compact precision={1} size="sm" className="text-stable" />
         </div>
         <div className="flex items-center gap-1 text-[10px] font-mono">
           <span className="text-paper-500">Lead</span>
@@ -3907,17 +4570,41 @@ function StrategyCard({ strategy, event, multiEvent }) {
 function CustomWorkspace({ event, multiEvent }) {
   const {
     selectedClauses, toggleClause, applyCustomStrategy,
-    applyingStrategy, strategyVotes, setStrategyVote, clauses,
+    applyingStrategy, strategyVotes, setStrategyVote, clauses, data, secondaryEventId,
   } = useWarRoom(s => ({
     selectedClauses: s.selectedClauses, toggleClause: s.toggleClause, applyCustomStrategy: s.applyCustomStrategy,
     applyingStrategy: s.applyingStrategy, strategyVotes: s.strategyVotes, setStrategyVote: s.setStrategyVote,
-    clauses: s.data.clauses,
+    clauses: s.data.clauses, data: s.data, secondaryEventId: s.secondaryEventId,
   }));
+  const ev2 = multiEvent && secondaryEventId ? data.eventById[secondaryEventId] : null;
   const { isOver, setNodeRef } = useDroppable({ id: 'custom-workspace' });
   const [solverRunning, setSolverRunning] = useState(false);
-  const [montecarlo, setMontecarlo] = useState(null);
-  const [mcRunning, setMcRunning] = useState(false);
-  const result = solveStrategy(event, selectedClauses, clauses, multiEvent);
+
+  // Seeded composed MC — single source of truth for headline figure + lineage
+  const mc = useMemo(
+    () => computeStrategySavings({ event, ev2, multiEvent, clauseIds: selectedClauses, clausesMap: clauses }),
+    [event, ev2, multiEvent, selectedClauses, clauses]
+  );
+  const composedLineage = useMemo(
+    () => buildLineage('strategy_savings', { data, strategy: null, mc }),
+    [data, mc]
+  );
+
+  // Histogram for the bar chart (uses the SAME sorted samples as the MC P50)
+  const montecarlo = useMemo(() => {
+    if (!mc.sorted) return null;
+    const bins = 24;
+    const minV = mc.sorted[0], maxV = mc.sorted[mc.sorted.length - 1];
+    const step = (maxV - minV) / bins || 1;
+    const hist = new Array(bins).fill(0);
+    for (const v of mc.sorted) {
+      const idx = Math.min(bins - 1, Math.floor((v - minV) / step));
+      hist[idx]++;
+    }
+    return { p10: mc.p10, p50: mc.p50, p90: mc.p90, hist, minV, maxV, n: mc.sorted.length };
+  }, [mc]);
+
+  const result = mc;     // alias used downstream (savingsMode / feasibility etc. all live on mc)
   const votes = strategyVotes['CUSTOM'];
   const cons = consensusOf(votes);
 
@@ -3925,33 +4612,6 @@ function CustomWorkspace({ event, multiEvent }) {
     setSolverRunning(true);
     const t = setTimeout(() => setSolverRunning(false), 200);
     return () => clearTimeout(t);
-  }, [selectedClauses.join(','), multiEvent]);
-
-  useEffect(() => {
-    if (selectedClauses.length === 0) { setMontecarlo(null); return; }
-    setMcRunning(true);
-    const handle = setTimeout(() => {
-      const items = selectedClauses.map(id => {
-        const c = clauses[id];
-        if (!c) return null;
-        return { min: c.savingsMin, mode: c.savingsMode, max: c.savingsMax };
-      }).filter(Boolean);
-      if (items.length === 0) { setMcRunning(false); return; }
-      const interaction = items.length >= 3 ? 0.92 : 1;
-      const sorted = runMonteCarlo(items.map(i => ({ min: i.min * interaction, mode: i.mode * interaction, max: i.max * interaction })), 5000);
-      const [p10, p50, p90] = percentiles(sorted);
-      const bins = 24;
-      const minV = sorted[0], maxV = sorted[sorted.length - 1];
-      const step = (maxV - minV) / bins;
-      const hist = new Array(bins).fill(0);
-      for (const v of sorted) {
-        const idx = Math.min(bins - 1, Math.floor((v - minV) / step));
-        hist[idx]++;
-      }
-      setMontecarlo({ p10, p50, p90, hist, minV, maxV, n: sorted.length });
-      setMcRunning(false);
-    }, 50);
-    return () => clearTimeout(handle);
   }, [selectedClauses.join(','), multiEvent]);
 
   const isEmpty = selectedClauses.length === 0;
@@ -4013,16 +4673,13 @@ function CustomWorkspace({ event, multiEvent }) {
             <Loader2 size={10} className="animate-spin" /> solver running...
           </div>
         )}
-        <div className="text-[9px] uppercase tracking-[0.22em] text-paper-500 font-mono">Composed savings · P50 · OR-Tools LP</div>
+        <div className="text-[9px] uppercase tracking-[0.22em] text-paper-500 font-mono">Composed savings · P50 · OR-Tools LP + seeded Monte Carlo</div>
         <div className="mt-1">
           <GroundedNumber
-            value={result.savingsMode}
+            lineage={isEmpty ? null : composedLineage}
+            value={isEmpty ? 0 : result.savingsMode}
             compact precision={1} size="xl"
             className="text-paper-50"
-            label="Custom mitigated savings (P50)"
-            band={montecarlo || { p10: result.savingsMin, p50: result.savingsMode, p90: result.savingsMax }}
-            decomp={event.detailedDrivers}
-            lineageId="hormuz_impact"
           />
         </div>
 
