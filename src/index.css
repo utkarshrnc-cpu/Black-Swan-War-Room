@@ -1,0 +1,522 @@
+@import "tailwindcss";
+
+/* ============================================================================
+ * Editorial Command Center @theme tokens — these become :root CSS variables and
+ * drive Tailwind v4 utility classes (bg-ink-100, text-paper-200, etc.).
+ *
+ * The values below are the WAR ROOM theme defaults. The [data-theme="sac-story"]
+ * block further down OVERRIDES these same variables with SAC Horizon values.
+ * Because Tailwind utilities reference these vars, the entire utility set
+ * automatically re-themes when the data-theme attribute on <html> changes.
+ * ========================================================================== */
+@theme {
+  --color-ink-0: #050507;
+  --color-ink-50: #0a0a0b;
+  --color-ink-100: #0f0f12;
+  --color-ink-200: #131316;
+  --color-ink-300: #18181c;
+  --color-ink-400: #1f1f24;
+  --color-ink-500: #27272d;
+  --color-ink-600: #34343c;
+  --color-ink-700: #44444d;
+
+  --color-paper-50: #fafaf7;
+  --color-paper-100: #f5f5f0;
+  --color-paper-200: #e8e8e0;
+  --color-paper-300: #c8c8be;
+  --color-paper-400: #a3a39a;
+  --color-paper-500: #71716a;
+  --color-paper-600: #4a4a44;
+
+  --color-severe: #ea580c;
+  --color-severe-soft: #f97316;
+  --color-amber: #f59e0b;
+  --color-amber-soft: #fbbf24;
+  --color-critical: #dc2626;
+  --color-critical-soft: #ef4444;
+  --color-stable: #10b981;
+  --color-stable-soft: #34d399;
+  --color-info: #06b6d4;
+  --color-info-soft: #22d3ee;
+
+  --font-sans: "Geist", -apple-system, system-ui, sans-serif;
+  --font-display: "Newsreader", "Source Serif Pro", Georgia, serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+
+  --ease-cinematic: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-stoic: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* ============================================================================
+ * THEME ROLE-BASED ALIASES — for new components and inline styles.
+ * These describe ROLE, not appearance. Each theme provides different values.
+ * ========================================================================== */
+
+:root,
+:root[data-theme="war-room"] {
+  /* Surfaces */
+  --color-bg-canvas:           #0a0a0b;
+  --color-bg-surface:          #131316;
+  --color-bg-surface-elevated: #18181c;
+  --color-bg-header-shell:     #0f0f12;
+
+  /* Text */
+  --color-text-primary:   #f5f5f0;
+  --color-text-secondary: #a3a39a;
+  --color-text-tertiary:  #71716a;
+  --color-text-inverse:   #0a0a0b;
+  --color-text-link:      #f59e0b;
+
+  /* Brand / primary */
+  --color-primary:        #f59e0b;
+  --color-primary-hover:  #fbbf24;
+  --color-primary-active: #d97706;
+  --color-primary-light:  rgba(245, 158, 11, 0.15);
+
+  /* Semantic */
+  --color-positive: #10b981;
+  --color-negative: #dc2626;
+  --color-neutral:  #71716a;
+  --color-warn:     #ea580c;
+
+  /* Borders */
+  --color-border:        #1f1f24;
+  --color-border-light:  #18181c;
+  --color-border-strong: #27272d;
+
+  /* Chart palette */
+  --color-chart-1: #ea580c;
+  --color-chart-2: #f59e0b;
+  --color-chart-3: #06b6d4;
+  --color-chart-4: #10b981;
+  --color-chart-5: #8b5cf6;
+  --color-chart-6: #ec4899;
+  --color-chart-7: #3b82f6;
+  --color-chart-8: #f43f5e;
+
+  /* Radii — War Room is mostly sharp */
+  --radius-sm:   2px;
+  --radius-md:   4px;
+  --radius-lg:   6px;
+  --radius-pill: 4px;
+
+  /* Shadows — War Room avoids paper-style shadows */
+  --shadow-card:    none;
+  --shadow-hover:   0 4px 12px rgba(0, 0, 0, 0.6);
+  --shadow-overlay: 0 8px 24px rgba(0, 0, 0, 0.7);
+
+  /* Typography role aliases */
+  --font-family-base:    "Geist", -apple-system, system-ui, sans-serif;
+  --font-family-display: "Newsreader", "Source Serif Pro", Georgia, serif;
+  --font-family-mono:    "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+
+  /* Animation accents (used by keyframes) */
+  --color-pulse-strong: rgba(234, 88, 12, 0.6);
+  --color-pulse-fade:   rgba(234, 88, 12, 0);
+  --color-glow-strong:  rgba(234, 88, 12, 0.55);
+  --color-glow-fade:    rgba(234, 88, 12, 0);
+  --color-scanline:     rgba(234, 88, 12, 0.5);
+  --color-hatch:        rgba(234, 88, 12, 0.08);
+  --color-audit-pulse:  rgba(245, 158, 11, 0.25);
+  --color-audit-rail:   rgba(245, 158, 11, 1);
+  --color-selection-bg: #f59e0b;
+  --color-selection-fg: #0a0a0b;
+
+  /* Background ambience */
+  --color-grid-line:    rgba(255, 255, 255, 0.012);
+  --color-vignette-end: rgba(0, 0, 0, 0.4);
+}
+
+/* ============================================================================
+ * SAC STORY — SAP Analytics Cloud Morning Horizon
+ *   Overrides BOTH the physical @theme tokens (so Tailwind utilities re-color)
+ *   AND the semantic role aliases (so inline styles re-color).
+ * ========================================================================== */
+:root[data-theme="sac-story"] {
+  /* Physical @theme overrides — remap dark "ink" to light surfaces, etc. */
+  --color-ink-0:   #FAFBFC;
+  --color-ink-50:  #F5F6F7;
+  --color-ink-100: #FFFFFF;
+  --color-ink-200: #FFFFFF;
+  --color-ink-300: #EAECEE;
+  --color-ink-400: #E5E5E5;
+  --color-ink-500: #D9D9D9;
+  --color-ink-600: #D9D9D9;
+  --color-ink-700: #8396A8;
+
+  --color-paper-50:  #1A2733;
+  --color-paper-100: #1A2733;
+  --color-paper-200: #2E3F50;
+  --color-paper-300: #556B82;
+  --color-paper-400: #556B82;
+  --color-paper-500: #8396A8;
+  --color-paper-600: #8396A8;
+
+  --color-severe:        #E76500;
+  --color-severe-soft:   #FA8500;
+  --color-amber:         #0070F2;
+  --color-amber-soft:    #1B90FF;
+  --color-critical:      #BB0000;
+  --color-critical-soft: #D60000;
+  --color-stable:        #30914C;
+  --color-stable-soft:   #36A41D;
+  --color-info:          #0070F2;
+  --color-info-soft:     #1B90FF;
+
+  /* Semantic role aliases — SAC Horizon */
+  --color-bg-canvas:           #F5F6F7;
+  --color-bg-surface:          #FFFFFF;
+  --color-bg-surface-elevated: #EAECEE;
+  --color-bg-header-shell:     #354A5F;
+
+  --color-text-primary:   #1A2733;
+  --color-text-secondary: #556B82;
+  --color-text-tertiary:  #8396A8;
+  --color-text-inverse:   #FFFFFF;
+  --color-text-link:      #0070F2;
+
+  --color-primary:        #0070F2;
+  --color-primary-hover:  #0064DA;
+  --color-primary-active: #0040B0;
+  --color-primary-light:  #D1E8FF;
+
+  --color-positive: #30914C;
+  --color-negative: #BB0000;
+  --color-neutral:  #788FA6;
+  --color-warn:     #E76500;
+
+  --color-border:        #D9D9D9;
+  --color-border-light:  #E5E5E5;
+  --color-border-strong: #8396A8;
+
+  /* SAC qualitative palette */
+  --color-chart-1: #5D87BA;
+  --color-chart-2: #F8B135;
+  --color-chart-3: #76C5BF;
+  --color-chart-4: #C7A2D2;
+  --color-chart-5: #E89BAB;
+  --color-chart-6: #4A6786;
+  --color-chart-7: #93C36A;
+  --color-chart-8: #F58D7C;
+
+  /* Radii — Horizon's pill signature */
+  --radius-sm:   4px;
+  --radius-md:   8px;
+  --radius-lg:   12px;
+  --radius-pill: 999px;
+
+  --shadow-card:    0 1px 2px rgba(58, 70, 86, 0.08);
+  --shadow-hover:   0 2px 8px rgba(58, 70, 86, 0.12);
+  --shadow-overlay: 0 4px 16px rgba(58, 70, 86, 0.16);
+
+  --font-family-base:    "72", "72full", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-family-display: "72", "72full", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-family-mono:    ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+
+  /* Re-route @theme font aliases too so .font-display utilities pick up "72" */
+  --font-sans:    "72", "72full", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-display: "72", "72full", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono:    ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+
+  /* Animation accents — SAC uses negative-red for alert */
+  --color-pulse-strong: rgba(187, 0, 0, 0.5);
+  --color-pulse-fade:   rgba(187, 0, 0, 0);
+  --color-glow-strong:  rgba(187, 0, 0, 0.35);
+  --color-glow-fade:    rgba(187, 0, 0, 0);
+  --color-scanline:     rgba(0, 112, 242, 0.4);
+  --color-hatch:        rgba(187, 0, 0, 0.05);
+  --color-audit-pulse:  rgba(0, 112, 242, 0.15);
+  --color-audit-rail:   rgba(0, 112, 242, 1);
+  --color-selection-bg: #0070F2;
+  --color-selection-fg: #FFFFFF;
+
+  /* Background ambience — hide grid + vignette */
+  --color-grid-line:    transparent;
+  --color-vignette-end: transparent;
+
+  /* Override Tailwind's DEFAULT named-color palette inside SAC theme so
+     utility classes like text-amber-400, bg-red-500/15, text-emerald-400, etc.
+     re-color to Horizon equivalents without touching the JSX. */
+  --color-amber-50:  #EAF4FF;
+  --color-amber-100: #D1E8FF;
+  --color-amber-200: #A3D1FF;
+  --color-amber-300: #4296FF;
+  --color-amber-400: #1B90FF;
+  --color-amber-500: #0070F2;
+  --color-amber-600: #0064DA;
+  --color-amber-700: #0040B0;
+
+  --color-orange-300: #FAA85A;
+  --color-orange-400: #FA8500;
+  --color-orange-500: #E76500;
+  --color-orange-600: #E76500;
+  --color-orange-700: #B85000;
+
+  --color-emerald-300: #56C772;
+  --color-emerald-400: #36A41D;
+  --color-emerald-500: #30914C;
+  --color-emerald-600: #2A8043;
+  --color-emerald-700: #1F6334;
+
+  --color-red-300: #E64C4C;
+  --color-red-400: #D60000;
+  --color-red-500: #BB0000;
+  --color-red-600: #A00000;
+  --color-red-700: #850000;
+
+  --color-cyan-300: #4296FF;
+  --color-cyan-400: #1B90FF;
+  --color-cyan-500: #0070F2;
+  --color-cyan-600: #0064DA;
+
+  --color-zinc-50:   #F5F6F7;
+  --color-zinc-100:  #EAECEE;
+  --color-zinc-200:  #D9D9D9;
+  --color-zinc-300:  #C8D3DE;
+  --color-zinc-400:  #8396A8;
+  --color-zinc-500:  #556B82;
+  --color-zinc-600:  #2E3F50;
+  --color-zinc-700:  #1A2733;
+  --color-zinc-800:  #1A2733;
+  --color-zinc-900:  #0A1420;
+  --color-zinc-950:  #0A1420;
+}
+
+/* Smooth theme transition for body & main surfaces */
+html {
+  transition: background-color 200ms ease, color 200ms ease;
+}
+
+/* ============================================================================
+ * BASE
+ * ========================================================================== */
+@layer base {
+  html, body, #root {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+  }
+
+  body {
+    background: var(--color-bg-canvas);
+    color: var(--color-text-primary);
+    font-family: var(--font-family-base);
+    font-feature-settings: "ss01", "cv11", "calt";
+    font-variant-numeric: tabular-nums;
+    overflow: hidden;
+    transition: background-color 200ms ease, color 200ms ease;
+  }
+
+  /* Background ambient grid — parameterized so SAC can null it out */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-image:
+      linear-gradient(var(--color-grid-line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--color-grid-line) 1px, transparent 1px);
+    background-size: 64px 64px;
+    z-index: 0;
+  }
+
+  /* Subtle vignette */
+  body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background: radial-gradient(ellipse at top, transparent 0%, var(--color-vignette-end) 100%);
+    z-index: 0;
+  }
+
+  #root {
+    position: relative;
+    z-index: 1;
+  }
+
+  ::selection {
+    background: var(--color-selection-bg);
+    color: var(--color-selection-fg);
+  }
+
+  *::-webkit-scrollbar { width: 8px; height: 8px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb { background: var(--color-ink-500); border-radius: 4px; }
+  *::-webkit-scrollbar-thumb:hover { background: var(--color-ink-600); }
+}
+
+/* ============================================================================
+ * UTILITIES — parameterized animations (all use CSS vars, theme-aware)
+ * ========================================================================== */
+@layer utilities {
+  .font-display { font-family: var(--font-display); font-feature-settings: "ss01", "liga"; }
+  .font-mono { font-family: var(--font-mono); }
+  .text-balance { text-wrap: balance; }
+  .tabular { font-variant-numeric: tabular-nums; }
+
+  .hairline-b { border-bottom: 1px solid var(--color-border); }
+  .hairline-t { border-top: 1px solid var(--color-border); }
+  .hairline-l { border-left: 1px solid var(--color-border); }
+  .hairline-r { border-right: 1px solid var(--color-border); }
+  .hairline { border: 1px solid var(--color-border); }
+  .hairline-soft { border: 1px solid var(--color-border-light); }
+
+  @keyframes pulseSevere {
+    0%, 100% { box-shadow: 0 0 0 0 var(--color-pulse-strong); }
+    50%      { box-shadow: 0 0 0 12px var(--color-pulse-fade); }
+  }
+  .pulse-severe { animation: pulseSevere 1.4s ease-out 3; }
+
+  @keyframes glowRing {
+    0%   { box-shadow: inset 0 0 0 0 var(--color-glow-fade); opacity: 0; }
+    20%  { box-shadow: inset 0 0 80px 0 var(--color-glow-strong); opacity: 1; }
+    100% { box-shadow: inset 0 0 200px 0 var(--color-glow-fade); opacity: 0; }
+  }
+  .glow-ring { animation: glowRing 1.2s var(--ease-cinematic) forwards; }
+
+  @keyframes slideDown {
+    from { transform: translateY(-100%); opacity: 0; }
+    to { transform: translateY(0); opacity: 1; }
+  }
+  .anim-slide-down { animation: slideDown 0.45s var(--ease-cinematic) forwards; }
+
+  @keyframes slideUp {
+    from { transform: translateY(20px); opacity: 0; }
+    to { transform: translateY(0); opacity: 1; }
+  }
+  .anim-slide-up { animation: slideUp 0.5s var(--ease-cinematic) forwards; }
+
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  .anim-fade-in { animation: fadeIn 0.6s var(--ease-stoic) forwards; }
+
+  @keyframes tick {
+    from { opacity: 0; transform: translateX(-6px); }
+    to { opacity: 1; transform: translateX(0); }
+  }
+  .anim-tick { animation: tick 0.4s var(--ease-stoic) forwards; }
+
+  @keyframes scanline {
+    0% { transform: translateY(0); }
+    100% { transform: translateY(100%); }
+  }
+  .scanline::before {
+    content: "";
+    position: absolute;
+    left: 0; right: 0; top: 0; height: 1px;
+    background: linear-gradient(90deg, transparent, var(--color-scanline), transparent);
+    animation: scanline 3s linear infinite;
+  }
+
+  @keyframes blink {
+    0%, 49%   { opacity: 1; }
+    50%, 100% { opacity: 0.3; }
+  }
+  .anim-blink { animation: blink 1.4s steps(1, end) infinite; }
+
+  @keyframes auditPulse {
+    0%   { background-color: transparent;              box-shadow: inset 2px 0 0 0 transparent; }
+    25%  { background-color: var(--color-audit-pulse); box-shadow: inset 2px 0 0 0 var(--color-audit-rail); }
+    100% { background-color: transparent;              box-shadow: inset 2px 0 0 0 transparent; }
+  }
+  .audit-pulse { animation: auditPulse 1.4s ease-out 2; }
+
+  .hatch {
+    background-image: repeating-linear-gradient(
+      45deg,
+      transparent 0,
+      transparent 8px,
+      var(--color-hatch) 8px,
+      var(--color-hatch) 9px
+    );
+  }
+}
+
+/* ============================================================================
+ * SAC STORY — component-level overrides
+ *   Only what cannot be captured by variable swaps alone:
+ *     - Pill-shape buttons (Horizon's signature)
+ *     - Card surfaces (white + soft shadow + medium radius)
+ *     - Shell-bar dark navy header with inverse text
+ *     - Range/slider/scrollbar repainting
+ * Every other component changes purely via the variable cascade above.
+ * ========================================================================== */
+:root[data-theme="sac-story"] *::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+}
+:root[data-theme="sac-story"] *::-webkit-scrollbar-thumb:hover {
+  background: var(--color-neutral);
+}
+
+/* All bordered elements become cards with light shadow and medium radius */
+:root[data-theme="sac-story"] .hairline {
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-card);
+}
+:root[data-theme="sac-story"] .hairline-soft {
+  border-radius: var(--radius-md);
+}
+
+/* Buttons → pill shape (Horizon's signature). Targets all <button> with .hairline. */
+:root[data-theme="sac-story"] button.hairline,
+:root[data-theme="sac-story"] [role="button"].hairline,
+:root[data-theme="sac-story"] button.sac-pill {
+  border-radius: var(--radius-pill);
+  box-shadow: none;
+}
+
+/* Shell-bar (top of header) — Fiori navy with inverse text */
+:root[data-theme="sac-story"] .shell-bar {
+  background: var(--color-bg-header-shell) !important;
+  color: var(--color-text-inverse);
+  /* Inside the shell bar, redefine local paper/text vars so all utility
+     classes that read text-paper-* automatically become inverse-tinted */
+  --color-paper-50:  #FFFFFF;
+  --color-paper-100: #FFFFFF;
+  --color-paper-200: #C8D3DE;
+  --color-paper-300: #C8D3DE;
+  --color-paper-400: #C8D3DE;
+  --color-paper-500: #8396A8;
+  --color-paper-600: #788FA6;
+  --color-border:    #1F3043;
+  --color-border-light: #29405B;
+  --color-bg-surface: #354A5F;
+  --color-bg-surface-elevated: #1F3043;
+}
+:root[data-theme="sac-story"] .shell-bar .hairline,
+:root[data-theme="sac-story"] .shell-bar .hairline-l,
+:root[data-theme="sac-story"] .shell-bar .hairline-r,
+:root[data-theme="sac-story"] .shell-bar .hairline-b {
+  border-color: #1F3043;
+  box-shadow: none;
+}
+
+/* Audit-pulse tab + collapsed audit tab: dial back the inset shadow for light theme */
+:root[data-theme="sac-story"] .audit-pulse {
+  --color-audit-pulse: rgba(0, 112, 242, 0.18);
+  --color-audit-rail:  #0070F2;
+}
+
+/* Recharts SVG: in SAC, give axis text + grid muted slate tones (only applies inside SAC) */
+:root[data-theme="sac-story"] .recharts-cartesian-axis-tick text,
+:root[data-theme="sac-story"] .recharts-text {
+  fill: var(--color-text-secondary);
+}
+:root[data-theme="sac-story"] .recharts-cartesian-grid line {
+  stroke: var(--color-border-light);
+}
+
+/* SAC range inputs (the BaselineVsMitigated slider, counterfactual) */
+:root[data-theme="sac-story"] input[type="range"] {
+  accent-color: var(--color-primary);
+}
+
+/* SAC: range slider thumbs picked up via accent-color above. */
+
+/* Tooltip / popover backgrounds in SAC should be light cards */
+:root[data-theme="sac-story"] .anim-fade-in[role="dialog"] {
+  box-shadow: var(--shadow-overlay);
+}
