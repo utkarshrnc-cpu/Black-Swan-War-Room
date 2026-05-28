@@ -52,15 +52,9 @@ The app **works without any API key** — Demo Mode is the default. The AI field
 
 ### Optional: connect an AI provider
 
-Either drop a key into `.env.local`:
+Click the gear icon in the header and configure **OpenAI**, **Anthropic**, or **Azure OpenAI** directly in the Settings modal. The Settings panel walks you through provider selection, key entry, and a one-token test ping before saving.
 
-```bash
-VITE_CHATPWC_API_KEY=your-key-here
-VITE_CHATPWC_BASE_URL=https://genai-sharedservice-americas.pwcinternal.com
-VITE_CHATPWC_MODEL=gpt-4o
-```
-
-Or click the gear icon in the header and configure **OpenAI**, **Anthropic**, or **Azure OpenAI** directly in the Settings modal. Keys entered there live only in this browser tab — never persisted to `localStorage`, `sessionStorage`, or `IndexedDB`.
+Keys entered there live only in this browser tab — never persisted to `localStorage`, `sessionStorage`, or `IndexedDB`. Refresh wipes them by design.
 
 ---
 
